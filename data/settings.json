@@ -1,0 +1,9 @@
+{
+  "botMode": "public",
+  "groups": {
+    "g1@g.us": {
+      "antilink": true,
+      "welcome": true
+    }
+  }
+}
