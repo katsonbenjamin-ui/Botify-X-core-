@@ -1,10 +1,7 @@
 'use strict';
 
-const fs   = require('fs');
-const path = require('path');
 const {
   default: makeWASocket,
-  useMultiFileAuthState,
   fetchLatestBaileysVersion,
   DisconnectReason,
   Browsers,
@@ -25,16 +22,14 @@ const {
 } = require('../events/messages');
 const { handleGroupParticipants } = require('../events/groupParticipants');
 const handleConnection             = require('../events/connection');
+const { usePgAuthState }           = require('./pgAuthState');
+const registry                     = require('./sessionRegistry');
 
 const sessions        = new Map();
 const pendingPairings = new Map();
 const qrCodes         = new Map();
 const reconnectDelays = new Map();
 const sessionLogs     = new Map();
-
-function authPathFor(id) {
-  return path.resolve(config.paths.auth, id);
-}
 
 function getSession(id)  { return sessions.get(id) || null; }
 
@@ -49,7 +44,8 @@ function getSessionLogs(id) { return sessionLogs.get(id) || []; }
 
 function listSessions() {
   return Array.from(sessions.entries()).map(([id, s]) => ({
-    id, connected: !!s.sock?.user, user: s.sock?.user || null, isOwner: !!s.isOwner,
+    id, connected: !!s.sock?.user, user: s.sock?.user || null,
+    isOwner: !!s.isOwner, active: !!s.active,
   }));
 }
 
@@ -63,14 +59,14 @@ async function fetchVersion() {
   } catch { return [2, 3000, 1023141840]; }
 }
 
-function _scheduleReconnect({ id, phoneNumber, isOwner, useQR }, delayOverride) {
+function _scheduleReconnect({ id, phoneNumber, isOwner, active }, delayOverride) {
   const prev      = reconnectDelays.get(id) || 0;
   const nextDelay = delayOverride !== undefined ? delayOverride
     : (prev === 0 ? 4_000 : Math.min(prev * 2, 120_000));
   reconnectDelays.set(id, nextDelay);
   logger.warn({ id, nextDelay }, 'Scheduling reconnect');
   const attempt = () => {
-    startSession({ id, phoneNumber, isOwner, useQR })
+    startSession({ id, phoneNumber, isOwner, active })
       .then(() => {}).catch((err) => {
         logger.error({ err, id }, 'Reconnect failed');
         const d = Math.min((reconnectDelays.get(id) || 4_000) * 2, 120_000);
@@ -81,14 +77,17 @@ function _scheduleReconnect({ id, phoneNumber, isOwner, useQR }, delayOverride) 
   setTimeout(attempt, nextDelay);
 }
 
-async function startSession({ id, phoneNumber = null, isOwner = false, useQR = false } = {}) {
+/**
+ * active defaults to false — bot connects to WhatsApp but ignores commands
+ * until the Client Panel user clicks Start, which calls activateSession().
+ */
+async function startSession({ id, phoneNumber = null, isOwner = false, active = false } = {}) {
   if (!id) throw new Error('Session id is required');
   if (sessions.has(id)) return sessions.get(id);
 
-  const authDir = authPathFor(id);
-  if (!fs.existsSync(authDir)) fs.mkdirSync(authDir, { recursive: true });
+  // Auth state from Postgres — survives Railway restarts
+  const { state, saveCreds } = await usePgAuthState(id);
 
-  const { state, saveCreds } = await useMultiFileAuthState(authDir);
   const version              = await fetchVersion();
   const msgRetryCounterCache = new NodeCache({ stdTTL: 60, useClones: false });
 
@@ -111,9 +110,13 @@ async function startSession({ id, phoneNumber = null, isOwner = false, useQR = f
     fireInitQueries:  true,
   });
 
+  // active=false: bot is connected to WhatsApp but ignores all commands
+  // active=true:  bot responds to commands (user clicked Start on Client Panel)
   const session = {
     id, sock, isOwner, phoneNumber, saveCreds,
-    onlineTimer: null, connectedAt: 0, shuttingDown: false, useQR, pairingCode: null,
+    onlineTimer: null, connectedAt: 0, shuttingDown: false,
+    active,
+    pairingCode: null,
   };
   sessions.set(id, session);
 
@@ -156,7 +159,7 @@ async function startSession({ id, phoneNumber = null, isOwner = false, useQR = f
     }
 
     if (connection === 'open') {
-      appendLog(id, 'Connected to WhatsApp.');
+      appendLog(id, 'Connected to WhatsApp.' + (session.active ? '' : ' (inactive — awaiting Start)'));
       pendingPairings.delete(id); qrCodes.delete(id);
       session.connectedAt = Date.now();
       reconnectDelays.delete(id);
@@ -166,8 +169,10 @@ async function startSession({ id, phoneNumber = null, isOwner = false, useQR = f
       }
       if (!isOwner && phoneNumber) users.markPaired(phoneNumber, true);
       botState.setConnected(true);
-      // onOpen: sends WhatsApp confirmation + notifies Admin Dashboard
-      try { await handleConnection.onOpen({ session }); } catch (err) { logger.error({ err }, 'connection.onOpen failed'); }
+      // Only send the "connected" WhatsApp greeting when the session is active
+      if (session.active) {
+        try { await handleConnection.onOpen({ session }); } catch (err) { logger.error({ err }, 'connection.onOpen failed'); }
+      }
     }
 
     if (connection === 'close') {
@@ -177,45 +182,61 @@ async function startSession({ id, phoneNumber = null, isOwner = false, useQR = f
       const restartNeeded = statusCode === DisconnectReason.restartRequired || statusCode === 515;
 
       appendLog(id, 'Connection closed: ' + statusCode);
-
-      // Notify Admin Dashboard that session went offline (client sessions only)
-      if (!isOwner && !session.shuttingDown) {
-        try { handleConnection.onClose({ id, isOwner }); } catch {}
-      }
-
       sessions.delete(id);
 
       if (loggedOut || replaced) { appendLog(id, loggedOut ? 'Logged out.' : 'Session replaced.'); return; }
-      if (!session.shuttingDown) { _scheduleReconnect({ id, phoneNumber, isOwner, useQR }, restartNeeded ? 2_000 : undefined); }
+      if (!session.shuttingDown) {
+        _scheduleReconnect(
+          { id, phoneNumber, isOwner, active: session.active },
+          restartNeeded ? 2_000 : undefined
+        );
+      }
     }
   });
 
-  sock.ev.on('messages.upsert', async ({ messages, type }) => {
-    if (type !== 'notify') return;
-    for (const msg of messages) {
-      try { await handleMessages({ sock, msg, sessionState, session }); } catch (err) { logger.error({ err }, 'msg handler error'); }
-    }
+  sock.ev.on('messages.upsert', async (payload) => {
+    // Inactive: bot is connected but ignores all messages/commands silently
+    if (!session.active) return;
+    if (payload.type !== 'notify') return;
+    try { await handleMessages({ sock, session, payload }); }
+    catch (err) { logger.error({ err }, 'msg handler error'); }
   });
 
   sock.ev.on('messages.delete', (item) => {
-    try { handleMessageDelete({ sock, item, sessionState }); } catch {}
+    if (!session.active) return;
+    try { handleMessageDelete(sock, item, session.state, session); } catch {}
   });
 
   sock.ev.on('messages.update', (updates) => {
-    try { handleMessageEdit({ sock, updates, sessionState }); } catch {}
+    if (!session.active) return;
+    try { handleMessageEdit(sock, updates, session.state, session); } catch {}
   });
 
   sock.ev.on('call', async (calls) => {
-    for (const call of calls) {
-      try { await handleCall({ sock, call, sessionState }); } catch {}
-    }
+    if (!session.active) return;
+    try { await handleCall(sock, calls, session.state); } catch {}
   });
 
   sock.ev.on('group-participants.update', async (update) => {
+    if (!session.active) return;
     try { await handleGroupParticipants({ sock, update, sessionState }); } catch {}
   });
 
   return session;
+}
+
+/**
+ * Activate a session: bot starts responding to commands.
+ * Called by /runtime/:id/start route.
+ */
+async function activateSession(id) {
+  const session = sessions.get(id);
+  if (session) {
+    session.active = true;
+    appendLog(id, 'Session activated — bot now responding to commands.');
+    try { await handleConnection.onOpen({ session }); } catch {}
+  }
+  await registry.activate(id);
 }
 
 async function stopSession(id) {
@@ -226,25 +247,16 @@ async function stopSession(id) {
   if (session.onlineTimer) { clearInterval(session.onlineTimer); session.onlineTimer = null; }
   sessions.delete(id);
   appendLog(id, 'Session stopped.');
-  // Notify admin
-  if (!session.isOwner) {
-    try { handleConnection.onClose({ id, isOwner: false }); } catch {}
-  }
+  await registry.deactivate(id);
 }
 
-function restoreExistingSessions() {
-  const authBase = config.paths.auth;
-  if (!fs.existsSync(authBase)) return [];
-  return fs.readdirSync(authBase, { withFileTypes: true })
-    .filter(e => e.isDirectory())
-    .map(e => startSession({ id: e.name, isOwner: e.name === 'owner' })
-      .catch(err => logger.warn({ id: e.name, err: err.message }, 'Failed to restore')));
-}
+function restoreExistingSessions() { return []; }
 
 function ownerSession() { return sessions.get('owner') || null; }
 
 module.exports = {
   startSession,
+  activateSession,
   stopSession,
   getSession,
   listSessions,
