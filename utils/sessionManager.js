@@ -30,7 +30,6 @@ const sessions        = new Map();
 const pendingPairings = new Map();
 const qrCodes         = new Map();
 const reconnectDelays = new Map();
-// Per-session log buffer (last 100 lines)
 const sessionLogs     = new Map();
 
 function authPathFor(id) {
@@ -167,6 +166,7 @@ async function startSession({ id, phoneNumber = null, isOwner = false, useQR = f
       }
       if (!isOwner && phoneNumber) users.markPaired(phoneNumber, true);
       botState.setConnected(true);
+      // onOpen: sends WhatsApp confirmation + notifies Admin Dashboard
       try { await handleConnection.onOpen({ session }); } catch (err) { logger.error({ err }, 'connection.onOpen failed'); }
     }
 
@@ -177,6 +177,12 @@ async function startSession({ id, phoneNumber = null, isOwner = false, useQR = f
       const restartNeeded = statusCode === DisconnectReason.restartRequired || statusCode === 515;
 
       appendLog(id, 'Connection closed: ' + statusCode);
+
+      // Notify Admin Dashboard that session went offline (client sessions only)
+      if (!isOwner && !session.shuttingDown) {
+        try { handleConnection.onClose({ id, isOwner }); } catch {}
+      }
+
       sessions.delete(id);
 
       if (loggedOut || replaced) { appendLog(id, loggedOut ? 'Logged out.' : 'Session replaced.'); return; }
@@ -212,7 +218,6 @@ async function startSession({ id, phoneNumber = null, isOwner = false, useQR = f
   return session;
 }
 
-// ── Stop a session cleanly ─────────────────────────────────────────────────────
 async function stopSession(id) {
   const session = sessions.get(id);
   if (!session) return;
@@ -221,9 +226,12 @@ async function stopSession(id) {
   if (session.onlineTimer) { clearInterval(session.onlineTimer); session.onlineTimer = null; }
   sessions.delete(id);
   appendLog(id, 'Session stopped.');
+  // Notify admin
+  if (!session.isOwner) {
+    try { handleConnection.onClose({ id, isOwner: false }); } catch {}
+  }
 }
 
-// ── Restore sessions on boot (used by index.js after registry filters expired) ──
 function restoreExistingSessions() {
   const authBase = config.paths.auth;
   if (!fs.existsSync(authBase)) return [];
