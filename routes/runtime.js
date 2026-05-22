@@ -2,9 +2,10 @@
 const express        = require('express');
 const sessionManager = require('../utils/sessionManager');
 const registry       = require('../utils/sessionRegistry');
+const { hasAuthState } = require('../utils/pgAuthState');
 
 const router = express.Router();
-const startLocks = new Map(); // prevent duplicate socket creation per session
+const startLocks = new Map();
 
 async function withLock(id, fn) {
   if (startLocks.get(id)) return { locked: true };
@@ -12,14 +13,14 @@ async function withLock(id, fn) {
   try { return await fn(); } finally { startLocks.delete(id); }
 }
 
-// POST /runtime/:id/register — called by panel to store expiry
-router.post('/:id/register', (req, res) => {
+// POST /runtime/:id/register — store expiry
+router.post('/:id/register', async (req, res) => {
   const { expiresAt } = req.body || {};
-  registry.register(req.params.id, { expiresAt: expiresAt || null });
+  await registry.register(req.params.id, { expiresAt: expiresAt || null });
   return res.json({ ok: true });
 });
 
-// POST /runtime/:id/start
+// POST /runtime/:id/start — activate the bot (start responding to commands)
 router.post('/:id/start', async (req, res) => {
   const { id } = req.params;
   const { expiresAt } = req.body || {};
@@ -27,16 +28,33 @@ router.post('/:id/start', async (req, res) => {
   if (expiresAt && new Date(expiresAt) < new Date())
     return res.status(403).json({ ok: false, error: 'Account expired. Contact your admin to renew.' });
 
-  registry.register(id, { expiresAt: expiresAt || null });
+  // Guard: credentials must exist in Postgres (pairing done via Portal)
+  const hasCreds = await hasAuthState(id);
+  if (!hasCreds) {
+    return res.status(400).json({
+      ok: false,
+      error: 'WhatsApp not paired. Open the Pairing Portal, link your number, then try again.',
+    });
+  }
+
+  await registry.register(id, { expiresAt: expiresAt || null });
 
   const existing = sessionManager.getSession(id);
-  if (existing && existing.sock?.user)
-    return res.json({ ok: true, status: 'running', message: 'Bot already running.' });
 
+  // Session already in memory — just activate it
+  if (existing && existing.sock?.user) {
+    await sessionManager.activateSession(id);
+    return res.json({ ok: true, status: 'running', message: 'Bot activated and running.' });
+  }
+
+  // Session not in memory — start it (active=true from the start)
   const result = await withLock(id, async () => {
     const s = sessionManager.getSession(id);
-    if (s && s.sock?.user) return { ok: true, status: 'running', message: 'Bot already running.' };
-    await sessionManager.startSession({ id, isOwner: false });
+    if (s && s.sock?.user) {
+      await sessionManager.activateSession(id);
+      return { ok: true, status: 'running', message: 'Bot activated and running.' };
+    }
+    await sessionManager.startSession({ id, isOwner: false, active: true });
     return { ok: true, status: 'starting', message: 'Bot starting...' };
   });
 
@@ -66,7 +84,8 @@ router.post('/:id/restart', async (req, res) => {
     await sessionManager.stopSession(id);
     await new Promise(r => setTimeout(r, 1500));
     const result = await withLock(id, async () => {
-      await sessionManager.startSession({ id, isOwner: false });
+      await sessionManager.startSession({ id, isOwner: false, active: true });
+      await sessionManager.activateSession(id);
       return { ok: true, status: 'restarting', message: 'Bot restarting...' };
     });
     if (result.locked) return res.json({ ok: true, status: 'restarting', message: 'Restart in progress...' });
@@ -77,10 +96,11 @@ router.post('/:id/restart', async (req, res) => {
 });
 
 // GET /runtime/:id/status
-router.get('/:id/status', (req, res) => {
+router.get('/:id/status', async (req, res) => {
   const { id } = req.params;
 
-  if (registry.isExpired(id)) {
+  const expired = await registry.isExpired(id);
+  if (expired) {
     sessionManager.stopSession(id).catch(() => {});
     return res.json({ ok: true, status: 'expired', connected: false });
   }
@@ -91,21 +111,26 @@ router.get('/:id/status', (req, res) => {
   if (!session) return res.json({ ok: true, status: starting ? 'starting' : 'stopped', connected: false });
 
   const connected = !!session.sock?.user;
-  const status = connected ? 'running' : starting ? 'starting' : session.shuttingDown ? 'stopped' : 'connecting';
-  return res.json({ ok: true, status, connected, phone: session.sock?.user?.id?.split(':')[0] || null });
+  const active    = !!session.active;
+  let status;
+  if (!connected) {
+    status = starting ? 'starting' : session.shuttingDown ? 'stopped' : 'connecting';
+  } else if (!active) {
+    status = 'connecting'; // connected but waiting for Start
+  } else {
+    status = 'running';
+  }
+  return res.json({ ok: true, status, connected, active, phone: session.sock?.user?.id?.split(':')[0] || null });
 });
 
-// GET /runtime/:id/validate
-router.get('/:id/validate', (req, res) => {
+// GET /runtime/:id/validate — check if credentials exist in DB
+router.get('/:id/validate', async (req, res) => {
   const { id } = req.params;
-  const fs     = require('fs');
-  const path   = require('path');
-  const config = require('../utils/config');
 
-  if (registry.isExpired(id)) return res.json({ ok: true, valid: false, reason: 'expired' });
+  const expired = await registry.isExpired(id);
+  if (expired) return res.json({ ok: true, valid: false, reason: 'expired' });
 
-  const authDir = path.join(config.paths.auth, id);
-  const valid   = fs.existsSync(authDir) && fs.readdirSync(authDir).length > 0;
+  const valid = await hasAuthState(id);
   return res.json({ ok: true, valid });
 });
 
@@ -114,7 +139,7 @@ router.get('/:id/logs', (req, res) => {
   return res.json({ ok: true, logs: sessionManager.getSessionLogs(req.params.id) });
 });
 
-// POST /runtime/:id/notify — WhatsApp notification (called by admin dashboard on renew)
+// POST /runtime/:id/notify
 router.post('/:id/notify', async (req, res) => {
   const { id } = req.params;
   const { message } = req.body || {};
@@ -124,7 +149,7 @@ router.post('/:id/notify', async (req, res) => {
   if (!session || !session.sock?.user) {
     return res.status(202).json({
       ok: false, queued: true,
-      message: 'Bot not currently connected — notification not sent. Client will see renewal on next login.'
+      message: 'Bot not currently connected — notification not sent.',
     });
   }
 
