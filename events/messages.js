@@ -4,8 +4,9 @@ const NodeCache = require('node-cache');
 const { checkAccess, denyMsg }     = require('../utils/access');
 const { getGroupSettings, addWarning, resetWarnings, addMsgCount } = require('../utils/dataManager');
 const { getAdminNumber }           = require('../utils/botState');
+const msgBuffer                    = require('../utils/msgBuffer');
 
-// ── Command handlers ───────────────────────────────────────────────────────────
+// ── Existing command handlers ──────────────────────────────────────────────────
 const antilinkCmd         = require('../commands/antilink');
 const anticallCmd         = require('../commands/anticall');
 const antideleteCmd       = require('../commands/antidelete');
@@ -46,13 +47,24 @@ const menuCmd             = require('../commands/menu');
 const botstatusCmd        = require('../commands/botstatus');
 const statusSaver         = require('../commands/statusSaver');
 
-// ── Caches ─────────────────────────────────────────────────────────────────────
-// Extended TTLs so antidelete/antiedit remain reliable across a 10-minute window
-const msgCache  = new NodeCache({ stdTTL: 600,  checkperiod: 60 });
-const editCache = new NodeCache({ stdTTL: 3600, checkperiod: 120 });
+// ── New command handlers (v2) ──────────────────────────────────────────────────
+const aiCmd          = require('../commands/ai');
+const summaryCmd     = require('../commands/summary');
+const autoreactCmd   = require('../commands/autoreact');
+const statusreplyCmd = require('../commands/statusreply');
+const shipCmd        = require('../commands/ship');
+const topchatCmd     = require('../commands/topchat');
+const toimgCmd       = require('../commands/toimg');
+const tomp3Cmd       = require('../commands/tomp3');
+const ttsCmd         = require('../commands/tts');
+const runtimeCmd     = require('../commands/runtime');
+const backupCmd      = require('../commands/backup');
+const autotypingCmd  = require('../commands/autotyping');
 
-// ── Global dedup — only for COMMANDS, not protocol messages ───────────────────
-const cmdDedup = new NodeCache({ stdTTL: 30, checkperiod: 10 });
+// ── Caches ─────────────────────────────────────────────────────────────────────
+const msgCache  = new NodeCache({ stdTTL: 600,  checkperiod: 60  });
+const editCache = new NodeCache({ stdTTL: 3600, checkperiod: 120 });
+const cmdDedup  = new NodeCache({ stdTTL: 30,   checkperiod: 10  });
 
 // ── In-memory message counts per group ────────────────────────────────────────
 const sessionMsgCounts = new Map();
@@ -77,10 +89,6 @@ function extractBody(msg) {
   );
 }
 
-/**
- * Returns a human-readable label for any message — used by antidelete/antiedit
- * so that media messages (without captions) are also caught and described.
- */
 function messageLabel(msg) {
   const m = msg.message;
   if (!m) return '';
@@ -108,12 +116,7 @@ function selfJid(sessionOwnerPhone) {
   return String(sessionOwnerPhone || '').replace(/\D/g, '') + '@s.whatsapp.net';
 }
 
-/**
- * Build a fake message object that points at the inner content of a view-once
- * so downloadMediaMessage can fetch it.
- */
 function fakeVoMsg(key, qm) {
-  // Unwrap all known view-once container formats
   const inner =
     qm.viewOnceMessage?.message          ||
     qm.viewOnceMessageV2?.message        ||
@@ -123,36 +126,23 @@ function fakeVoMsg(key, qm) {
   return null;
 }
 
-/**
- * Extract the new text from an editedMessage in all known Baileys/WA formats.
- */
 function extractEditedText(proto) {
   const ec = proto?.editedMessage;
   if (!ec) return '';
   return (
-    ec.conversation                                     ||
-    ec.extendedTextMessage?.text                        ||
-    ec.imageMessage?.caption                            ||
-    ec.videoMessage?.caption                            ||
-    ec.documentMessage?.caption                         ||
-    ec.message?.conversation                            ||
-    ec.message?.extendedTextMessage?.text               ||
-    ec.message?.imageMessage?.caption                   ||
-    ec.message?.videoMessage?.caption                   ||
+    ec.conversation                         ||
+    ec.extendedTextMessage?.text            ||
+    ec.imageMessage?.caption                ||
+    ec.videoMessage?.caption                ||
+    ec.documentMessage?.caption             ||
+    ec.message?.conversation                ||
+    ec.message?.extendedTextMessage?.text   ||
+    ec.message?.imageMessage?.caption       ||
+    ec.message?.videoMessage?.caption       ||
     ''
   );
 }
 
-/**
- * Detect whether a message is a WhatsApp "group mention" —
- * i.e. someone is tagging / forwarding a group preview into the chat.
- *
- * Modern WhatsApp/Baileys formats:
- *   1. msg.message.groupMentionedMessage          (top-level type)
- *   2. extendedTextMessage.contextInfo.groupMentionedMessage
- *   3. contextInfo.mentionedJid containing a @g.us JID
- *      (when someone @-mentions a group in a text message)
- */
 function isGroupMentionMsg(msg) {
   if (!msg?.message) return false;
   const m   = msg.message;
@@ -160,10 +150,9 @@ function isGroupMentionMsg(msg) {
            || m.imageMessage?.contextInfo
            || m.videoMessage?.contextInfo
            || null;
-
   return !!(
-    m.groupMentionedMessage                              ||
-    ctx?.groupMentionedMessage                          ||
+    m.groupMentionedMessage                            ||
+    ctx?.groupMentionedMessage                         ||
     ctx?.mentionedJid?.some(j => j.endsWith('@g.us'))
   );
 }
@@ -191,11 +180,11 @@ async function handleMessages({ session, payload }) {
         continue;
       }
 
-      // ── Protocol messages — handled PER SESSION, no global dedup ──────────
+      // ── Protocol messages — per session, no dedup ──────────────────────────
       const proto = msg.message?.protocolMessage;
 
       if (proto !== undefined && proto !== null) {
-        // ── Delete (REVOKE, type 0) ────────────────────────────────────────
+        // Delete (REVOKE, type 0)
         if (proto.type === 0) {
           if (state.antidelete) {
             const deletedId = proto.key?.id;
@@ -215,12 +204,11 @@ async function handleMessages({ session, payload }) {
           continue;
         }
 
-        // ── Edit (MESSAGE_EDIT, type 14) ───────────────────────────────────
+        // Edit (MESSAGE_EDIT, type 14)
         if (proto.type === 14) {
           if (state.antiedit) {
             const originalId = proto.key?.id;
             const newText    = extractEditedText(proto);
-
             if (originalId && newText) {
               const originalText = editCache.get(originalId);
               if (originalText && newText !== originalText) {
@@ -238,11 +226,10 @@ async function handleMessages({ session, payload }) {
           continue;
         }
 
-        // All other protocol types = internal WA housekeeping
-        continue;
+        continue; // all other protocol types = WA housekeeping
       }
 
-      // ── Alternative edit format (some Baileys / client versions) ──────────
+      // ── Alternative edit format ────────────────────────────────────────────
       const editedMsg = msg.message?.editedMessage;
       if (editedMsg) {
         if (state.antiedit) {
@@ -278,7 +265,6 @@ async function handleMessages({ session, payload }) {
 
       // ── fromMe messages (owner typed on their own phone) ──────────────────
       if (msg.key.fromMe) {
-        // Resolve contextInfo from any message type the owner might have used
         const fmCtx =
           msg.message?.extendedTextMessage?.contextInfo ||
           msg.message?.imageMessage?.contextInfo        ||
@@ -287,13 +273,12 @@ async function handleMessages({ session, payload }) {
           msg.message?.documentMessage?.contextInfo     ||
           null;
 
-        // ── Status auto-save ───────────────────────────────────────────────
-        // Fires when owner replies (with text OR media) to someone's status
+        // Status auto-save
         if (fmCtx?.remoteJid === 'status@broadcast' && fmCtx?.quotedMessage) {
           await statusSaver.handle(sock, msg, sessionOwnerPhone);
         }
 
-        // ── Secret view-once reveal (emoji-only reply from owner) ──────────
+        // Secret view-once reveal (emoji-only reply from owner)
         if (!isCommand && fmCtx?.quotedMessage && body.trim() && EMOJI_RE.test(body.trim())) {
           const qm = fmCtx.quotedMessage;
           const hasMedia = !!(
@@ -313,9 +298,13 @@ async function handleMessages({ session, payload }) {
         if (!isCommand) continue;
       }
 
-      if (from === 'status@broadcast') continue;
+      // ── Status@broadcast — auto-reply feature ─────────────────────────────
+      if (from === 'status@broadcast') {
+        await statusreplyCmd.handleAutoReply(sock, msg, state);
+        continue;
+      }
 
-      // ── Secret view-once reveal (emoji-only reply from anyone else) ───────
+      // ── Secret view-once reveal (emoji-only reply from others) ─────────────
       const replyCtx = msg.message?.extendedTextMessage?.contextInfo;
       if (!isCommand && replyCtx?.quotedMessage && body.trim() && EMOJI_RE.test(body.trim())) {
         const qm = replyCtx.quotedMessage;
@@ -333,14 +322,19 @@ async function handleMessages({ session, payload }) {
         }
       }
 
-      // ── Cache EVERY message (text + media) for antidelete / antiedit ──────
+      // ── Cache ALL messages (text + media) for antidelete / antiedit ──────
       const label = messageLabel(msg);
       if (label) {
         msgCache.set(msg.key.id,  { from, body: label });
         editCache.set(msg.key.id, label);
       }
 
-      // ── Track message counts (in-memory, real-time) ───────────────────────
+      // ── Feed group message buffer (for *summary) ──────────────────────────
+      if (isGroup && !isCommand && !msg.key.fromMe && body) {
+        msgBuffer.add(from, cleanNum(sender), body);
+      }
+
+      // ── Track message counts ───────────────────────────────────────────────
       if (isGroup && sender) {
         const num = cleanNum(sender);
         if (!sessionMsgCounts.has(from)) sessionMsgCounts.set(from, new Map());
@@ -349,7 +343,16 @@ async function handleMessages({ session, payload }) {
         addMsgCount(from, num);
       }
 
-      // ── Group enforcement (antigroupmention, antilink) ────────────────────
+      // ── Auto React ────────────────────────────────────────────────────────
+      if (state.autoreact && !isCommand && !msg.key.fromMe && autoreactCmd.shouldReact()) {
+        try {
+          await sock.sendMessage(from, {
+            react: { text: autoreactCmd.randomEmoji(), key: msg.key },
+          });
+        } catch (_) {}
+      }
+
+      // ── Group enforcement ──────────────────────────────────────────────────
       if (isGroup && sender && !isCommand) {
         const gs = getGroupSettings(from);
 
@@ -406,7 +409,7 @@ async function handleMessages({ session, payload }) {
 
       if (!isCommand) continue;
 
-      // ── Global command dedup — one execution per message ID across sessions ─
+      // ── Global command dedup ───────────────────────────────────────────────
       if (!msg.key.fromMe) {
         const dedupKey = `cmd:${msg.key.id}`;
         if (cmdDedup.get(dedupKey)) continue;
@@ -439,6 +442,15 @@ async function handleMessages({ session, payload }) {
         sessionMsgCounts,
       };
 
+      // ── Auto Typing — simulate before every command reply ─────────────────
+      if (state.autotyping) {
+        autotypingCmd.simulateTyping(sock, from).catch(() => {});
+        // Fire-and-forget: typing indicator runs in parallel, command executes immediately
+        // This avoids blocking the event loop while still showing the indicator.
+        await new Promise(r => setTimeout(r, 300)); // brief yield so composing fires first
+      }
+
+      // ── Command dispatch ───────────────────────────────────────────────────
       switch (cmd) {
         // Group management
         case 'antigroupmention':   await antigroupmentionCmd.handle(ctx);  break;
@@ -461,6 +473,7 @@ async function handleMessages({ session, payload }) {
         case 'tagall':             await tagallCmd.handle(ctx);            break;
         case 'warn':               await warnCmd.handle(ctx);              break;
         case 'welcome':            await welcomeCmd.handle(ctx);           break;
+
         // Tools
         case 'block':              await blockCmd.handle(ctx);             break;
         case 'delete':             await deleteCmd.handle(ctx);            break;
@@ -472,15 +485,31 @@ async function handleMessages({ session, payload }) {
         case 'togstatus':          await togstatusCmd.handle(ctx);         break;
         case 'unblock':            await unblockCmd.handle(ctx);           break;
         case 'vv':                 await vvCmd.handle(ctx);                break;
+
+        // New tools (v2)
+        case 'ai':                 await aiCmd.handle(ctx);                break;
+        case 'summary':            await summaryCmd.handle(ctx);           break;
+        case 'ship':               await shipCmd.handle(ctx);              break;
+        case 'topchat':            await topchatCmd.handle(ctx);           break;
+        case 'toimg':              await toimgCmd.handle(ctx);             break;
+        case 'tomp3':              await tomp3Cmd.handle(ctx);             break;
+        case 'tts':                await ttsCmd.handle(ctx);               break;
+        case 'runtime':            await runtimeCmd.handle(ctx);           break;
+        case 'backup':             await backupCmd.handle(ctx);            break;
+
         // Settings
         case 'alwaysonline':       await alwaysonlineCmd.handle(ctx);      break;
         case 'anticall':           await anticallCmd.handle(ctx);          break;
         case 'antidelete':         await antideleteCmd.handle(ctx);        break;
         case 'antiedit':           await antieditCmd.handle(ctx);          break;
+        case 'autoreact':          await autoreactCmd.handle(ctx);         break;
+        case 'autotyping':         await autotypingCmd.handle(ctx);        break;
+        case 'statusreply':        await statusreplyCmd.handle(ctx);       break;
         case 'botstatus':          await botstatusCmd.handle(ctx);         break;
         case 'menu':               await menuCmd.handle(ctx);              break;
         case 'mode':               await modeCmd.handle(ctx);              break;
         case 'ping':               await pingCmd.handle(ctx);              break;
+
         default: break;
       }
     } catch (e) {
@@ -489,7 +518,7 @@ async function handleMessages({ session, payload }) {
   }
 }
 
-// ── handleMessageDelete — fired by messages.delete event ──────────────────────
+// ── handleMessageDelete ────────────────────────────────────────────────────────
 async function handleMessageDelete(sock, update, state, session) {
   if (!state?.antidelete) return;
   try {
@@ -509,7 +538,7 @@ async function handleMessageDelete(sock, update, state, session) {
   } catch (e) { console.error('[AntiDelete]', e.message); }
 }
 
-// ── handleMessageEdit — fired by messages.update event ────────────────────────
+// ── handleMessageEdit ──────────────────────────────────────────────────────────
 async function handleMessageEdit(sock, updates, state, session) {
   if (!state?.antiedit) return;
   try {
@@ -525,17 +554,16 @@ async function handleMessageEdit(sock, updates, state, session) {
       if (!original) continue;
 
       const m      = update.message;
-      // Cover all known edit-event shapes across Baileys versions
       const edited =
-        m?.editedMessage?.message?.conversation                              ||
-        m?.editedMessage?.message?.extendedTextMessage?.text                 ||
-        m?.editedMessage?.message?.imageMessage?.caption                     ||
-        m?.editedMessage?.message?.videoMessage?.caption                     ||
-        m?.protocolMessage?.editedMessage?.conversation                      ||
-        m?.protocolMessage?.editedMessage?.extendedTextMessage?.text         ||
-        m?.protocolMessage?.editedMessage?.imageMessage?.caption             ||
-        m?.conversation                                                      ||
-        m?.extendedTextMessage?.text                                         ||
+        m?.editedMessage?.message?.conversation                      ||
+        m?.editedMessage?.message?.extendedTextMessage?.text         ||
+        m?.editedMessage?.message?.imageMessage?.caption             ||
+        m?.editedMessage?.message?.videoMessage?.caption             ||
+        m?.protocolMessage?.editedMessage?.conversation              ||
+        m?.protocolMessage?.editedMessage?.extendedTextMessage?.text ||
+        m?.protocolMessage?.editedMessage?.imageMessage?.caption     ||
+        m?.conversation                                              ||
+        m?.extendedTextMessage?.text                                 ||
         '';
 
       if (!edited || edited === original) continue;
@@ -564,4 +592,10 @@ async function handleCall(sock, calls, state) {
   }
 }
 
-module.exports = { handleMessages, handleMessageDelete, handleMessageEdit, handleCall, sessionMsgCounts };
+module.exports = {
+  handleMessages,
+  handleMessageDelete,
+  handleMessageEdit,
+  handleCall,
+  sessionMsgCounts,
+};
