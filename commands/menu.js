@@ -3,11 +3,10 @@
 const { getSessionOwnerMode } = require('../utils/dataManager');
 const { getAdminNumber }      = require('../utils/botState');
 
-const VERSION      = '1.1.4';
-const PLUGIN_COUNT = 37; // total commands
+const VERSION      = '2.0.0';
+const PLUGIN_COUNT = 49;
 
 async function handle({ sock, from, sessionOwnerPhone }) {
-  // Send loading message first
   await sock.sendMessage(from, { text: '⏳ _Loading BOTIFY-X menu..._' });
 
   const start   = Date.now();
@@ -20,45 +19,48 @@ async function handle({ sock, from, sessionOwnerPhone }) {
   const text = `┏▣ ◈ BOTIFY-X ◈
 ┃ ᴏᴡɴᴇʀ    : ${owner}
 ┃ ᴘʀᴇғɪx   : [ * ]
-┃ ʜᴏsᴛ     : Railway
+┃ ʜᴏsᴛ     : Oracle / Railway
 ┃ ᴘʟᴜɢɪɴs  : ${PLUGIN_COUNT}
 ┃ ᴍᴏᴅᴇ     : ${modeStr}
 ┃ ᴠᴇʀsɪᴏɴ  : v${VERSION}
 ┃ sᴘᴇᴇᴅ    : ${pingMs}ms
 ┗▣
 
-┏▣ ◈ GROUP MENU ◈
+┏▣ ◈ GROUP MANAGEMENT ◈
 ┃ ➽ antigroupmention
 ┃ ➽ antilink
-┃ ➽ approve
-┃ ➽ approveall
-┃ ➽ close
-┃ ➽ closetime
-┃ ➽ demote
+┃ ➽ approve / approveall
+┃ ➽ close / open
+┃ ➽ closetime / opentime
+┃ ➽ demote / promote
 ┃ ➽ disapproveall
-┃ ➽ goodbye
+┃ ➽ goodbye / welcome
 ┃ ➽ hidetag
 ┃ ➽ kick
 ┃ ➽ listactive
-┃ ➽ open
-┃ ➽ opentime
-┃ ➽ promote
-┃ ➽ resetlink
-┃ ➽ resetwarn
+┃ ➽ resetlink / resetwarn
 ┃ ➽ tagall
 ┃ ➽ warn
-┃ ➽ welcome
 ┗▣
 
 ┏▣ ◈ TOOLS ◈
-┃ ➽ block
+┃ ➽ ai          — AI chat
+┃ ➽ backup      — export settings
+┃ ➽ block / unblock
 ┃ ➽ delete
 ┃ ➽ getpp
 ┃ ➽ helpers
 ┃ ➽ listblocked
 ┃ ➽ resetcount
+┃ ➽ runtime     — system stats
+┃ ➽ ship        — compatibility
 ┃ ➽ sticker  ›  s
+┃ ➽ summary     — AI group recap
+┃ ➽ toimg       — sticker → image
+┃ ➽ tomp3       — video → mp3
+┃ ➽ topchat     — top chatters
 ┃ ➽ togstatus
+┃ ➽ tts         — text to speech
 ┃ ➽ unblock
 ┃ ➽ vv
 ┗▣
@@ -68,10 +70,13 @@ async function handle({ sock, from, sessionOwnerPhone }) {
 ┃ ➽ anticall
 ┃ ➽ antidelete
 ┃ ➽ antiedit
+┃ ➽ autoreact   — emoji reactions
+┃ ➽ autotyping  — typing indicator
 ┃ ➽ botstatus
 ┃ ➽ menu
 ┃ ➽ mode
 ┃ ➽ ping
+┃ ➽ statusreply — auto status reply
 ┗▣
 
 ┏▣ ◈ SECRET FEATURES ◈
