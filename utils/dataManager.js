@@ -4,11 +4,11 @@
  * dataManager.js — persistent storage for settings, warnings, session state,
  * and message counts.
  *
- * Primary storage: local JSON files (fast, synchronous).
+ * Primary storage : local JSON files (fast, synchronous).
  * Secondary storage: Postgres via pgStore (fire-and-forget write-through).
  *
  * On startup call hydrateFromPg() ONCE before starting sessions so that
- * settings survive Railway restarts even without a mounted volume.
+ * settings survive Railway / Oracle restarts even without a mounted volume.
  */
 
 const fs   = require('fs');
@@ -42,11 +42,6 @@ function pgSave(key, value) {
 }
 
 // ── Hydrate local files from Postgres on startup ───────────────────────────────
-/**
- * Call once at process start (before sessions resume) to restore any
- * settings that were written to Postgres in a previous Railway deployment.
- * Falls back silently if Postgres is unavailable.
- */
 async function hydrateFromPg() {
   const store = pg();
   if (!store) return;
@@ -57,42 +52,28 @@ async function hydrateFromPg() {
     { pgKey: 'msgcounts', file: CF, fallback: {} },
   ];
 
-  for (const { pgKey, file, fallback } of keys) {
+  for (const { pgKey, file } of keys) {
     try {
       const val = await store.get(pgKey);
-      if (val && typeof val === 'object') {
-        w(file, val);
-      }
+      if (val && typeof val === 'object') w(file, val);
     } catch (_) {}
   }
 
   // Hydrate per-session state files
   try {
-    const store2 = pg();
-    if (!store2) return;
-    // We can't enumerate all sessions from Postgres without a scan, so we
-    // re-hydrate state for any key that starts with 'state-'
-    // This requires a helper query — only attempt if pool is ready.
+    await store.ready();
     const { Pool } = require('pg');
-    // Re-use the same pool from pgStore — get it indirectly
-    const allRows = await store2.ready().then(async (ok) => {
-      if (!ok) return [];
-      // pgStore exposes get/set but not scan; do a one-off query here
-      const { Pool: P2 } = require('pg');
-      const p = new P2({
-        connectionString: process.env.DATABASE_URL,
-        ssl: { rejectUnauthorized: false },
-        max: 1,
-        idleTimeoutMillis: 5000,
-      });
-      const result = await p.query(
-        "SELECT key, value FROM botify_settings WHERE key LIKE 'state-%'"
-      );
-      await p.end();
-      return result.rows;
+    const p = new Pool({
+      connectionString: process.env.DATABASE_URL,
+      ssl: { rejectUnauthorized: false },
+      max: 1,
+      idleTimeoutMillis: 5000,
     });
-
-    for (const row of allRows) {
+    const result = await p.query(
+      "SELECT key, value FROM botify_settings WHERE key LIKE 'state-%'"
+    );
+    await p.end();
+    for (const row of result.rows) {
       const sf = _stateFile(row.key.replace(/^state-/, ''));
       try { w(sf, row.value); } catch (_) {}
     }
@@ -100,7 +81,7 @@ async function hydrateFromPg() {
 }
 
 // ── Users ─────────────────────────────────────────────────────────────────────
-function getUsers()     { return r(UF, []); }
+function getUsers() { return r(UF, []); }
 
 function addUser(phone, days = 30) {
   const users  = getUsers();
@@ -137,7 +118,7 @@ function isUserAllowed(phone) {
   return { allowed: true };
 }
 
-// ── Per-session-owner mode ─────────────────────────────────────────────────────
+// ── Per-session-owner mode ────────────────────────────────────────────────────
 function getSessionOwnerMode(phone) {
   if (!phone) return getSettings().botMode || 'public';
   const user = getUsers().find(u => u.phone === phone);
@@ -169,7 +150,9 @@ function setBotMode(mode) { const s = getSettings(); s.botMode = mode; saveSetti
 function getGroupSettings(gid) {
   const s = getSettings();
   if (!s.groups)       s.groups = {};
-  if (!s.groups[gid])  s.groups[gid] = { antilink: false, welcome: false, goodbye: false, antigroupmention: false };
+  if (!s.groups[gid])  s.groups[gid] = {
+    antilink: false, welcome: false, goodbye: false, antigroupmention: false,
+  };
   return s.groups[gid];
 }
 
@@ -177,7 +160,7 @@ function updateGroupSettings(gid, patch) {
   const s = getSettings();
   if (!s.groups) s.groups = {};
   s.groups[gid] = { ...(s.groups[gid] || {}), ...patch };
-  saveSettings(s);            // includes pgSave('settings', ...)
+  saveSettings(s);
 }
 
 // ── Warnings ──────────────────────────────────────────────────────────────────
@@ -192,8 +175,8 @@ function addWarning(gid, phone) {
   const ww = getWarnings(); const k = `${gid}:${phone}`;
   ww[k] = (ww[k] || 0) + 1; _saveWarnings(ww); return ww[k];
 }
-function resetWarnings(gid, phone) { const ww = getWarnings(); delete ww[`${gid}:${phone}`]; _saveWarnings(ww); }
-function getWarningCount(gid, phone) { return getWarnings()[`${gid}:${phone}`] || 0; }
+function resetWarnings(gid, phone)  { const ww = getWarnings(); delete ww[`${gid}:${phone}`]; _saveWarnings(ww); }
+function getWarningCount(gid, phone){ return getWarnings()[`${gid}:${phone}`] || 0; }
 
 // ── Per-session state persistence ──────────────────────────────────────────────
 function _stateFile(phoneOrId) {
@@ -201,26 +184,29 @@ function _stateFile(phoneOrId) {
   return path.join(D, `state-${key}.json`);
 }
 
+// ⚠️ Add all toggleable session flags here so they persist across restarts.
+const SESSION_STATE_KEYS = [
+  'anticall', 'antidelete', 'antiedit', 'alwaysonline',
+  'autoreact', 'autotyping', 'statusreply',
+];
+
 function loadSessionState(phoneOrId) {
-  return r(_stateFile(phoneOrId), {
-    anticall: false, antidelete: false, antiedit: false, alwaysonline: false,
-  });
+  const defaults = Object.fromEntries(SESSION_STATE_KEYS.map(k => [k, false]));
+  return { ...defaults, ...r(_stateFile(phoneOrId), {}) };
 }
 
 function saveSessionState(phoneOrId, state) {
   try {
     if (!fs.existsSync(D)) fs.mkdirSync(D, { recursive: true });
-    const keys = ['anticall', 'antidelete', 'antiedit', 'alwaysonline'];
-    const slim = {};
-    for (const k of keys) slim[k] = !!state[k];
+    const slim = Object.fromEntries(SESSION_STATE_KEYS.map(k => [k, !!state[k]]));
     w(_stateFile(phoneOrId), slim);
     pgSave(`state-${String(phoneOrId).replace(/[^a-zA-Z0-9_-]/g, '_')}`, slim);
   } catch (e) {
-    console.error('[SaveSessionState] Failed to save state for', phoneOrId, '—', e.message);
+    console.error('[SaveSessionState]', phoneOrId, e.message);
   }
 }
 
-// ── Message count tracking (for *listactive) ───────────────────────────────────
+// ── Message count tracking (for *listactive / *topchat) ───────────────────────
 function getMsgCounts() { return r(CF, {}); }
 
 function addMsgCount(groupJid, phone) {
@@ -229,8 +215,7 @@ function addMsgCount(groupJid, phone) {
     const k = `${groupJid}|||${phone}`;
     c[k] = (c[k] || 0) + 1;
     w(CF, c);
-    // Throttle pgSave for counts — only sync every 50 increments to avoid hammering PG
-    if (c[k] % 50 === 0) pgSave('msgcounts', c);
+    if (c[k] % 50 === 0) pgSave('msgcounts', c); // throttled Postgres sync
   } catch (_) {}
 }
 
@@ -239,8 +224,7 @@ function getGroupMsgCounts(groupJid) {
   const out = {};
   for (const [k, v] of Object.entries(c)) {
     if (k.startsWith(`${groupJid}|||`)) {
-      const phone = k.slice(groupJid.length + 3);
-      out[phone]  = v;
+      out[k.slice(groupJid.length + 3)] = v;
     }
   }
   return out;
