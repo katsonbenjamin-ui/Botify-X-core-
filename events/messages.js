@@ -47,17 +47,14 @@ const botstatusCmd        = require('../commands/botstatus');
 const statusSaver         = require('../commands/statusSaver');
 
 // ── Caches ─────────────────────────────────────────────────────────────────────
-// Extended TTLs for antiedit/antidelete reliability
+// Extended TTLs so antidelete/antiedit remain reliable across a 10-minute window
 const msgCache  = new NodeCache({ stdTTL: 600,  checkperiod: 60 });
 const editCache = new NodeCache({ stdTTL: 3600, checkperiod: 120 });
 
 // ── Global dedup — only for COMMANDS, not protocol messages ───────────────────
-// Prevents duplicate command execution when owner + user session are both active
-// in the same group. Protocol messages (antidelete/antiedit) bypass this so each
-// session can independently evaluate its own state flags.
 const cmdDedup = new NodeCache({ stdTTL: 30, checkperiod: 10 });
 
-// ── In-memory message counts per group (resets on bot restart) ─────────────────
+// ── In-memory message counts per group ────────────────────────────────────────
 const sessionMsgCounts = new Map();
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
@@ -80,6 +77,29 @@ function extractBody(msg) {
   );
 }
 
+/**
+ * Returns a human-readable label for any message — used by antidelete/antiedit
+ * so that media messages (without captions) are also caught and described.
+ */
+function messageLabel(msg) {
+  const m = msg.message;
+  if (!m) return '';
+  const body = extractBody(msg);
+  if (body) return body;
+  if (m.imageMessage)        return '[Image]';
+  if (m.videoMessage)        return '[Video]';
+  if (m.audioMessage)        return '[Audio]';
+  if (m.documentMessage)     return `[Document: ${m.documentMessage.fileName || 'file'}]`;
+  if (m.stickerMessage)      return '[Sticker]';
+  if (m.contactMessage)      return '[Contact]';
+  if (m.locationMessage)     return '[Location]';
+  if (m.liveLocationMessage) return '[Live Location]';
+  if (m.pollCreationMessage) return `[Poll: ${m.pollCreationMessage.name || ''}]`;
+  if (m.viewOnceMessage || m.viewOnceMessageV2 || m.viewOnceMessageV2Extension)
+    return '[View Once]';
+  return '[Media]';
+}
+
 function cleanNum(jid) {
   return (jid || '').split('@')[0].split(':')[0];
 }
@@ -88,17 +108,24 @@ function selfJid(sessionOwnerPhone) {
   return String(sessionOwnerPhone || '').replace(/\D/g, '') + '@s.whatsapp.net';
 }
 
+/**
+ * Build a fake message object that points at the inner content of a view-once
+ * so downloadMediaMessage can fetch it.
+ */
 function fakeVoMsg(key, qm) {
+  // Unwrap all known view-once container formats
   const inner =
     qm.viewOnceMessage?.message          ||
     qm.viewOnceMessageV2?.message        ||
     qm.viewOnceMessageV2Extension?.message;
   if (inner) return { key, message: inner };
-  if (qm.imageMessage || qm.videoMessage) return { key, message: qm };
+  if (qm.imageMessage || qm.videoMessage || qm.audioMessage) return { key, message: qm };
   return null;
 }
 
-// Extract new text from a proto.editedMessage in all known Baileys formats
+/**
+ * Extract the new text from an editedMessage in all known Baileys/WA formats.
+ */
 function extractEditedText(proto) {
   const ec = proto?.editedMessage;
   if (!ec) return '';
@@ -113,6 +140,31 @@ function extractEditedText(proto) {
     ec.message?.imageMessage?.caption                   ||
     ec.message?.videoMessage?.caption                   ||
     ''
+  );
+}
+
+/**
+ * Detect whether a message is a WhatsApp "group mention" —
+ * i.e. someone is tagging / forwarding a group preview into the chat.
+ *
+ * Modern WhatsApp/Baileys formats:
+ *   1. msg.message.groupMentionedMessage          (top-level type)
+ *   2. extendedTextMessage.contextInfo.groupMentionedMessage
+ *   3. contextInfo.mentionedJid containing a @g.us JID
+ *      (when someone @-mentions a group in a text message)
+ */
+function isGroupMentionMsg(msg) {
+  if (!msg?.message) return false;
+  const m   = msg.message;
+  const ctx = m.extendedTextMessage?.contextInfo
+           || m.imageMessage?.contextInfo
+           || m.videoMessage?.contextInfo
+           || null;
+
+  return !!(
+    m.groupMentionedMessage                              ||
+    ctx?.groupMentionedMessage                          ||
+    ctx?.mentionedJid?.some(j => j.endsWith('@g.us'))
   );
 }
 
@@ -133,15 +185,13 @@ async function handleMessages({ session, payload }) {
       const from = msg.key.remoteJid;
       if (!from) continue;
 
-      // Drop messages that predate this socket's connection (replayed history)
+      // Drop replayed history that predates this socket's connection
       const msgTimestampMs = (msg.messageTimestamp || 0) * 1000;
       if (connectedAt > 0 && msgTimestampMs > 0 && msgTimestampMs < connectedAt - 15000) {
         continue;
       }
 
       // ── Protocol messages — handled PER SESSION, no global dedup ──────────
-      // Each session independently checks its own state.antidelete / state.antiedit
-      // so both owner and user sessions can have their own flags active.
       const proto = msg.message?.protocolMessage;
 
       if (proto !== undefined && proto !== null) {
@@ -152,7 +202,7 @@ async function handleMessages({ session, payload }) {
             if (deletedId) {
               const cached = msgCache.get(deletedId);
               if (cached) {
-                const dest = selfJid(sessionOwnerPhone);
+                const dest  = selfJid(sessionOwnerPhone);
                 const label = cached.from && cached.from !== dest
                   ? `\n📍 _From: ${cached.from}_\n` : '\n';
                 await sock.sendMessage(dest, {
@@ -174,15 +224,14 @@ async function handleMessages({ session, payload }) {
             if (originalId && newText) {
               const originalText = editCache.get(originalId);
               if (originalText && newText !== originalText) {
-                const dest     = selfJid(sessionOwnerPhone);
-                const chatJid  = proto.key?.remoteJid || from;
-                const label    = chatJid && chatJid !== dest
+                const dest    = selfJid(sessionOwnerPhone);
+                const chatJid = proto.key?.remoteJid || from;
+                const label   = chatJid && chatJid !== dest
                   ? `\n📍 _From: ${chatJid}_\n` : '\n';
                 await sock.sendMessage(dest, {
                   text: `✏️ *Message Edited*${label}\n📌 *Original:*\n_"${originalText}"_\n\n🔄 *Edited to:*\n_"${newText}"_`,
                 });
               }
-              // Always update cache so we can track subsequent edits
               editCache.set(originalId, newText);
             }
           }
@@ -229,17 +278,27 @@ async function handleMessages({ session, payload }) {
 
       // ── fromMe messages (owner typed on their own phone) ──────────────────
       if (msg.key.fromMe) {
-        const fmCtx = msg.message?.extendedTextMessage?.contextInfo;
+        // Resolve contextInfo from any message type the owner might have used
+        const fmCtx =
+          msg.message?.extendedTextMessage?.contextInfo ||
+          msg.message?.imageMessage?.contextInfo        ||
+          msg.message?.videoMessage?.contextInfo        ||
+          msg.message?.audioMessage?.contextInfo        ||
+          msg.message?.documentMessage?.contextInfo     ||
+          null;
 
-        if (fmCtx?.remoteJid === 'status@broadcast') {
+        // ── Status auto-save ───────────────────────────────────────────────
+        // Fires when owner replies (with text OR media) to someone's status
+        if (fmCtx?.remoteJid === 'status@broadcast' && fmCtx?.quotedMessage) {
           await statusSaver.handle(sock, msg, sessionOwnerPhone);
         }
 
+        // ── Secret view-once reveal (emoji-only reply from owner) ──────────
         if (!isCommand && fmCtx?.quotedMessage && body.trim() && EMOJI_RE.test(body.trim())) {
           const qm = fmCtx.quotedMessage;
           const hasMedia = !!(
             qm.viewOnceMessage || qm.viewOnceMessageV2 || qm.viewOnceMessageV2Extension ||
-            qm.imageMessage    || qm.videoMessage
+            qm.imageMessage    || qm.videoMessage       || qm.audioMessage
           );
           if (hasMedia) {
             const fake = fakeVoMsg(
@@ -256,13 +315,13 @@ async function handleMessages({ session, payload }) {
 
       if (from === 'status@broadcast') continue;
 
-      // ── Secret view-once reveal ───────────────────────────────────────────
+      // ── Secret view-once reveal (emoji-only reply from anyone else) ───────
       const replyCtx = msg.message?.extendedTextMessage?.contextInfo;
       if (!isCommand && replyCtx?.quotedMessage && body.trim() && EMOJI_RE.test(body.trim())) {
         const qm = replyCtx.quotedMessage;
         const hasMedia = !!(
           qm.viewOnceMessage || qm.viewOnceMessageV2 || qm.viewOnceMessageV2Extension ||
-          qm.imageMessage    || qm.videoMessage
+          qm.imageMessage    || qm.videoMessage       || qm.audioMessage
         );
         if (hasMedia) {
           const fake = fakeVoMsg(
@@ -274,10 +333,11 @@ async function handleMessages({ session, payload }) {
         }
       }
 
-      // ── Cache for antidelete / antiedit ───────────────────────────────────
-      if (body) {
-        msgCache.set(msg.key.id,  { from, body });
-        editCache.set(msg.key.id, body);
+      // ── Cache EVERY message (text + media) for antidelete / antiedit ──────
+      const label = messageLabel(msg);
+      if (label) {
+        msgCache.set(msg.key.id,  { from, body: label });
+        editCache.set(msg.key.id, label);
       }
 
       // ── Track message counts (in-memory, real-time) ───────────────────────
@@ -289,15 +349,11 @@ async function handleMessages({ session, payload }) {
         addMsgCount(from, num);
       }
 
-      // ── Group enforcement (antilink, antigroupmention) ────────────────────
+      // ── Group enforcement (antigroupmention, antilink) ────────────────────
       if (isGroup && sender && !isCommand) {
         const gs = getGroupSettings(from);
 
-        const isGroupMention =
-          !!msg.message?.groupMentionedMessage ||
-          !!(msg.message?.extendedTextMessage?.contextInfo?.groupMentionedMessage);
-
-        if (gs.antigroupmention && isGroupMention) {
+        if (gs.antigroupmention && isGroupMentionMsg(msg)) {
           try {
             await sock.sendMessage(from, {
               delete: { remoteJid: from, id: msg.key.id, participant: sender, fromMe: false },
@@ -308,14 +364,14 @@ async function handleMessages({ session, payload }) {
           const count = addWarning(from, num);
           if (count >= 5) {
             await sock.sendMessage(from, {
-              text: `🚨 @${num} has been *removed* for repeatedly mentioning groups in status!`,
+              text: `🚨 @${num} has been *removed* for repeatedly mentioning groups!`,
               mentions: [sender],
             });
             try { await sock.groupParticipantsUpdate(from, [sender], 'remove'); } catch {}
             resetWarnings(from, num);
           } else {
             await sock.sendMessage(from, {
-              text: `🔕 @${num}, group mentions in status are *not allowed* here!\n⚠️ Warning *${count}/5* — ${5 - count} more warning(s) before removal.`,
+              text: `🔕 @${num}, group mentions are *not allowed* here!\n⚠️ Warning *${count}/5* — ${5 - count} more warning(s) before removal.`,
               mentions: [sender],
             });
           }
@@ -433,7 +489,7 @@ async function handleMessages({ session, payload }) {
   }
 }
 
-// ── handleMessageDelete ────────────────────────────────────────────────────────
+// ── handleMessageDelete — fired by messages.delete event ──────────────────────
 async function handleMessageDelete(sock, update, state, session) {
   if (!state?.antidelete) return;
   try {
@@ -453,30 +509,37 @@ async function handleMessageDelete(sock, update, state, session) {
   } catch (e) { console.error('[AntiDelete]', e.message); }
 }
 
-// ── handleMessageEdit ──────────────────────────────────────────────────────────
+// ── handleMessageEdit — fired by messages.update event ────────────────────────
 async function handleMessageEdit(sock, updates, state, session) {
   if (!state?.antiedit) return;
   try {
     const sessionOwnerPhone = session?.phoneNumber || getAdminNumber();
     const dest = selfJid(sessionOwnerPhone);
+
     for (const { key, update } of (updates || [])) {
       if (!update?.message) continue;
-      const jid      = key.remoteJid;
-      if (!jid) continue;
+      const jid = key.remoteJid;
+      if (!jid)  continue;
+
       const original = editCache.get(key.id);
       if (!original) continue;
 
       const m      = update.message;
+      // Cover all known edit-event shapes across Baileys versions
       const edited =
-        m?.editedMessage?.message?.conversation              ||
-        m?.editedMessage?.message?.extendedTextMessage?.text ||
-        m?.protocolMessage?.editedMessage?.conversation      ||
-        m?.protocolMessage?.editedMessage?.extendedTextMessage?.text ||
-        m?.conversation                                      ||
-        m?.extendedTextMessage?.text                         ||
+        m?.editedMessage?.message?.conversation                              ||
+        m?.editedMessage?.message?.extendedTextMessage?.text                 ||
+        m?.editedMessage?.message?.imageMessage?.caption                     ||
+        m?.editedMessage?.message?.videoMessage?.caption                     ||
+        m?.protocolMessage?.editedMessage?.conversation                      ||
+        m?.protocolMessage?.editedMessage?.extendedTextMessage?.text         ||
+        m?.protocolMessage?.editedMessage?.imageMessage?.caption             ||
+        m?.conversation                                                      ||
+        m?.extendedTextMessage?.text                                         ||
         '';
 
       if (!edited || edited === original) continue;
+
       const label = jid && jid !== dest ? `\n📍 _From: ${jid}_\n` : '\n';
       await sock.sendMessage(dest, {
         text: `✏️ *Message Edited*${label}\n📌 *Original:*\n_"${original}"_\n\n🔄 *Edited to:*\n_"${edited}"_`,
