@@ -32,28 +32,32 @@ function requireApiKey(req, res, next) {
 app.use('/runtime', requireApiKey, runtimeRoutes);
 app.get('/healthz', (_, res) => res.json({ ok: true, ts: Date.now() }));
 
-const PORT = Number(process.env.PORT || 3000);
+const PORT   = Number(process.env.PORT || 3000);
 const server = app.listen(PORT, '0.0.0.0', () => console.log('[BOTIFY X Core] Running on port ' + PORT));
 
-// Auto-restore sessions after Railway restart
-// Sessions boot as inactive=false; activateSession() is called when panel user clicks Start
 const sessionManager = require('./utils/sessionManager');
 const registry       = require('./utils/sessionRegistry');
+const { hydrateFromPg } = require('./utils/dataManager');
 
-registry.init().then(async () => {
-  const validSessions = await registry.getAllValid();
-  if (validSessions.length) {
-    console.log('[BOTIFY X] Auto-restoring ' + validSessions.length + ' valid session(s)...');
-    for (const id of validSessions) {
-      // Check if this session was previously active (user had clicked Start)
-      const wasActive = await registry.isActive(id).catch(() => false);
-      sessionManager.startSession({ id, isOwner: false, active: wasActive })
-        .catch(err => console.error('[BOTIFY X] Restore failed for ' + id + ':', err.message));
+// ── Startup: hydrate settings from Postgres BEFORE restoring sessions ──────────
+// This ensures antilink/antigroupmention/antidelete flags survive Railway restarts
+// even without a mounted volume. Falls back silently if no DATABASE_URL.
+registry.init()
+  .then(() => hydrateFromPg())
+  .then(async () => {
+    const validSessions = await registry.getAllValid();
+    if (validSessions.length) {
+      console.log('[BOTIFY X] Auto-restoring ' + validSessions.length + ' valid session(s)...');
+      for (const id of validSessions) {
+        const wasActive = await registry.isActive(id).catch(() => false);
+        sessionManager.startSession({ id, isOwner: false, active: wasActive })
+          .catch(err => console.error('[BOTIFY X] Restore failed for ' + id + ':', err.message));
+      }
+    } else {
+      console.log('[BOTIFY X] No sessions to restore.');
     }
-  } else {
-    console.log('[BOTIFY X] No sessions to restore.');
-  }
-}).catch(err => console.error('[BOTIFY X] Registry init failed:', err.message));
+  })
+  .catch(err => console.error('[BOTIFY X] Startup error:', err.message));
 
 function shutdown(sig) {
   console.log('[BOTIFY X] ' + sig + ' — shutting down gracefully...');
