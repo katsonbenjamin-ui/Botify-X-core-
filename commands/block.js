@@ -1,51 +1,38 @@
 'use strict';
 
 /**
- * *block — block a contact so they cannot message the linked WhatsApp account.
+ * *block — block a contact.
  *
- * FIX: JID normalization strips MD device suffixes.
- * Modern Baileys uses number:device@s.whatsapp.net — we must strip to number@s.whatsapp.net
- * before calling updateBlockStatus(), otherwise it silently fails.
+ * FIXES:
+ *   • Uses normalizeJid() + resolveMentions() from messageContext
+ *   • Supports: reply block / mention block / raw number block
+ *   • Strips MD device suffix before calling updateBlockStatus
  */
 
-/**
- * Normalize any JID format to a plain user JID:
- *   447911123456:0@s.whatsapp.net  → 447911123456@s.whatsapp.net
- *   447911123456@s.whatsapp.net    → 447911123456@s.whatsapp.net
- *   447911123456                   → 447911123456@s.whatsapp.net
- */
-function normalizeJid(raw) {
-  if (!raw) return null;
-  const withoutDomain = raw.split('@')[0]; // strip @s.whatsapp.net / @g.us etc.
-  const withoutDevice = withoutDomain.split(':')[0]; // strip :0 device suffix
-  const digits = withoutDevice.replace(/\D/g, '');
-  if (!digits) return null;
-  return digits + '@s.whatsapp.net';
-}
+const { resolveContext, resolveMentions, normalizeJid } = require('../utils/messageContext');
 
-async function handle({ sock, from, msg }) {
+async function handle({ sock, from, msg, args }) {
   const m   = msg.message;
-  if (!m) return sock.sendMessage(from, { text: '❌ Reply to a message or @mention someone to block.' });
+  if (!m) return sock.sendMessage(from, { text: '❌ No message content.' });
 
-  // Extract target from reply (participant) or @mention
-  const ctx = m.extendedTextMessage?.contextInfo
-           || m.imageMessage?.contextInfo
-           || m.videoMessage?.contextInfo
-           || m.audioMessage?.contextInfo
-           || m.documentMessage?.contextInfo
-           || null;
+  const ctx      = resolveContext(msg);
+  const mentions = resolveMentions(msg);
 
-  const rawTarget = ctx?.participant || ctx?.mentionedJid?.[0] || null;
+  // Priority: reply author → @mention → raw number arg
+  let rawTarget =
+    ctx?.participant ||            // reply → who sent the quoted message
+    mentions[0]      ||            // @mention
+    (args[0] ? args[0].replace(/\D/g, '') + '@s.whatsapp.net' : null); // raw number
 
   if (!rawTarget) {
     return sock.sendMessage(from, {
-      text: '❌ *Reply to a message or @mention someone to block them.*\n\n📌 Usage: *block',
+      text: '❌ *Reply to, @mention, or type the number to block.*\n📌 Usage:\n*block (reply)\n*block @user\n*block 447911123456',
     });
   }
 
   const jid = normalizeJid(rawTarget);
   if (!jid) {
-    return sock.sendMessage(from, { text: '❌ Could not resolve target JID.' });
+    return sock.sendMessage(from, { text: '❌ Could not resolve a valid JID to block.' });
   }
 
   const displayNum = jid.split('@')[0];
@@ -59,7 +46,7 @@ async function handle({ sock, from, msg }) {
   } catch (e) {
     console.error('[Block] Failed for', jid, '—', e.message);
     return sock.sendMessage(from, {
-      text: `❌ Block failed for +${displayNum}.\n_Error: ${e.message}_`,
+      text: `❌ Block failed for +${displayNum}.\n_${e.message}_`,
     });
   }
 }

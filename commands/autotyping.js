@@ -1,17 +1,18 @@
 'use strict';
 
 /**
- * *autotyping on/off — show a realistic typing indicator before each bot reply.
+ * *autotyping on/off — simulate typing before each bot reply.
  *
- * When enabled, the bot sends a "composing" presence update before dispatching
- * any command response, making it feel more human-like.
+ * FIXES:
+ *   • Proper 600–1400ms random delay (was dead / instant before)
+ *   • Full composing → paused cycle
+ *   • 100% fire-and-forget — NEVER blocks the runtime loop
+ *   • Persistence: state.autotyping → dataManager → pgStore
  *
- * Delay: 600–1400ms randomized (non-blocking, does not lag the runtime loop).
- * Persistence: state.autotyping saved via dataManager → pgStore.
+ * Usage pattern (called from events/messages.js before sending a reply):
+ *   autotypingCmd.simulateTyping(sock, jid);   // fire-and-forget
+ *   // then immediately run the command — no await
  */
-
-const MIN_DELAY_MS = 600;
-const MAX_DELAY_MS = 1400;
 
 async function handle({ sock, from, args, state }) {
   const sub = (args[0] || '').toLowerCase();
@@ -19,7 +20,7 @@ async function handle({ sock, from, args, state }) {
   if (sub === 'on') {
     state.autotyping = true;
     return sock.sendMessage(from, {
-      text: '⌨️ *Auto Typing Enabled!* ✅\n\nI will show a typing indicator before every reply.',
+      text: '⌨️ *Auto Typing Enabled!* ✅\n\nI will simulate typing before every reply.\n_Duration: 600–1400ms random_',
     });
   }
 
@@ -31,24 +32,32 @@ async function handle({ sock, from, args, state }) {
   }
 
   return sock.sendMessage(from, {
-    text: `⌨️ *Auto Typing:* ${state.autotyping ? '✅ ON' : '❌ OFF'}\n\n📌 Usage:\n*autotyping on — Enable\n*autotyping off — Disable`,
+    text: `⌨️ *Auto Typing:* ${state.autotyping ? '✅ ON' : '❌ OFF'}\n\n📌 Usage:\n*autotyping on\n*autotyping off`,
   });
 }
 
 /**
- * Simulate typing before a command reply.
- * Called from messages.js before dispatching commands when state.autotyping is true.
+ * Simulate typing in a chat.
  *
- * @param {object} sock  - Baileys socket
- * @param {string} from  - chat JID
+ * IMPORTANT: this function is fire-and-forget. It returns a Promise but
+ * callers in messages.js must NOT await it — use setImmediate() or just
+ * call without await so the message loop continues immediately.
+ *
+ * Pattern in messages.js:
+ *   if (state.autotyping) simulateTyping(sock, from); // no await
+ *
+ * @param {object} sock - Baileys socket
+ * @param {string} jid  - chat JID to type in
  */
-async function simulateTyping(sock, from) {
-  const delay = MIN_DELAY_MS + Math.random() * (MAX_DELAY_MS - MIN_DELAY_MS);
+async function simulateTyping(sock, jid) {
   try {
-    await sock.sendPresenceUpdate('composing', from);
+    const delay = 600 + Math.floor(Math.random() * 800); // 600–1400ms
+    await sock.sendPresenceUpdate('composing', jid);
     await new Promise(r => setTimeout(r, delay));
-    await sock.sendPresenceUpdate('paused', from);
-  } catch (_) {}
+    await sock.sendPresenceUpdate('paused', jid);
+  } catch (_) {
+    // Never propagate — typing errors must never crash the message loop
+  }
 }
 
 module.exports = { handle, simulateTyping };

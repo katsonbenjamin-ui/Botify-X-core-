@@ -3,34 +3,24 @@
 /**
  * *vv — reveal a view-once message by replying to it.
  *
- * Fixes vs old version:
- * - Handles viewOnceMessageV2 / viewOnceMessageV2Extension more robustly.
- * - Correct stanzaId/participant resolution for download.
- * - handleSecret now also supports audio view-once.
+ * FIXES:
+ *   • Uses resolveContext() from messageContext — works for ALL message types
+ *   • unwrapViewOnce() covers all V1/V2/V2Extension layers
+ *   • handleSecret now also handles plain media (image/video/audio) not just VO
+ *   • reuploadRequest fallback for expired media
  */
 
 const { downloadMediaMessage } = require('@whiskeysockets/baileys');
+const {
+  resolveContext,
+  unwrapViewOnce,
+} = require('../utils/messageContext');
+
 const SLOG = {
   level: 'silent',
-  info() {}, error() {}, warn() {}, debug() {}, trace() {},
-  child() { return this; },
+  info(){}, error(){}, warn(){}, debug(){}, trace(){},
+  child(){ return this; },
 };
-
-/**
- * Unwrap all known view-once container formats.
- * Returns the inner message object that contains imageMessage/videoMessage/audioMessage.
- */
-function unwrapVO(msgContent) {
-  if (!msgContent) return null;
-  return (
-    msgContent.viewOnceMessage?.message          ||
-    msgContent.viewOnceMessageV2?.message        ||
-    msgContent.viewOnceMessageV2Extension?.message ||
-    // Some Baileys versions nest it one level deeper
-    msgContent.viewOnceMessage?.message?.viewOnceMessage?.message ||
-    null
-  );
-}
 
 function mediaType(inner) {
   if (!inner) return null;
@@ -40,25 +30,45 @@ function mediaType(inner) {
   return null;
 }
 
+async function downloadWithFallback(sock, fakeMsg) {
+  try {
+    return await downloadMediaMessage(
+      fakeMsg, 'buffer', {},
+      { logger: SLOG, reuploadRequest: sock.updateMediaMessage },
+    );
+  } catch (_) {
+    return downloadMediaMessage(fakeMsg, 'buffer', {}, { logger: SLOG });
+  }
+}
+
 /**
- * *vv — manual reveal, sends to current chat.
+ * *vv — manual reveal, sends media to the current chat.
  */
 async function handle({ sock, from, msg }) {
-  const ctx = msg.message?.extendedTextMessage?.contextInfo;
+  // resolveContext() picks up contextInfo from any message type
+  const ctx = resolveContext(msg);
+
   if (!ctx?.quotedMessage) {
-    return sock.sendMessage(from, { text: '❌ *Reply to a view-once message to reveal it.*' });
+    return sock.sendMessage(from, {
+      text: '❌ *Reply to a view-once message to reveal it.*',
+    });
   }
 
   const qm    = ctx.quotedMessage;
-  const inner = unwrapVO(qm) || qm;
+  // Try VO unwrap first; fall back to plain media
+  const inner = unwrapViewOnce(qm) || (
+    qm.imageMessage || qm.videoMessage || qm.audioMessage ? qm : null
+  );
   const type  = mediaType(inner);
 
-  if (!type) {
-    return sock.sendMessage(from, { text: '❌ No view-once media found in the quoted message.' });
+  if (!type || !inner) {
+    return sock.sendMessage(from, {
+      text: '❌ No view-once or media found in the quoted message.',
+    });
   }
 
   try {
-    const fake = {
+    const fakeMsg = {
       key: {
         remoteJid:   ctx.remoteJid || from,
         id:          ctx.stanzaId  || msg.key.id,
@@ -68,19 +78,14 @@ async function handle({ sock, from, msg }) {
       message: inner,
     };
 
-    let buf;
-    try {
-      buf = await downloadMediaMessage(
-        fake, 'buffer', {},
-        { logger: SLOG, reuploadRequest: sock.updateMediaMessage },
-      );
-    } catch (_) {
-      buf = await downloadMediaMessage(fake, 'buffer', {}, { logger: SLOG });
+    const buf = await downloadWithFallback(sock, fakeMsg);
+    if (!buf || buf.length === 0) {
+      return sock.sendMessage(from, { text: '❌ Could not retrieve media — it may have expired.' });
     }
 
     if (type === 'image') await sock.sendMessage(from, { image: buf });
     else if (type === 'video') await sock.sendMessage(from, { video: buf });
-    else if (type === 'audio') await sock.sendMessage(from, { audio: buf, mimetype: 'audio/mp4' });
+    else if (type === 'audio') await sock.sendMessage(from, { audio: buf, mimetype: inner.audioMessage?.mimetype || 'audio/mp4' });
   } catch (e) {
     console.error('[VV]', e.message);
     await sock.sendMessage(from, { text: '❌ Could not reveal — media may have expired.' });
@@ -88,34 +93,30 @@ async function handle({ sock, from, msg }) {
 }
 
 /**
- * handleSecret — auto-triggered when anyone replies to a view-once with only emojis.
+ * handleSecret — auto-triggered by the message pipeline when anyone replies
+ * to a view-once (or plain media) with only emojis, OR reacts to it.
  * Sends raw media ONLY to the session owner's "Message Yourself".
+ *
+ * @param {object} sock      - Baileys socket
+ * @param {object} fakeMsg   - { key, message: inner } built by the pipeline
+ * @param {string} destJid   - owner's self-JID
  */
-async function handleSecret(sock, msg, destJid) {
-  if (!destJid) return;
+async function handleSecret(sock, fakeMsg, destJid) {
+  if (!destJid || !fakeMsg?.message) return;
 
-  const inner = msg.message;
-  if (!inner) return;
-
-  const type = mediaType(inner);
+  const type = mediaType(fakeMsg.message);
   if (!type) return;
 
   try {
-    let buf;
-    try {
-      buf = await downloadMediaMessage(
-        msg, 'buffer', {},
-        { logger: SLOG, reuploadRequest: sock.updateMediaMessage },
-      );
-    } catch (_) {
-      buf = await downloadMediaMessage(msg, 'buffer', {}, { logger: SLOG });
-    }
-
+    const buf = await downloadWithFallback(sock, fakeMsg);
     if (!buf || buf.length === 0) return;
 
     if (type === 'image') await sock.sendMessage(destJid, { image: buf });
     else if (type === 'video') await sock.sendMessage(destJid, { video: buf });
-    else if (type === 'audio') await sock.sendMessage(destJid, { audio: buf, mimetype: 'audio/mp4' });
+    else if (type === 'audio') await sock.sendMessage(destJid, {
+      audio:    buf,
+      mimetype: fakeMsg.message.audioMessage?.mimetype || 'audio/mp4',
+    });
   } catch (e) {
     console.error('[VV Secret]', e.message);
   }
