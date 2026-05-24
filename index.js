@@ -13,7 +13,8 @@ const DATA_DIR = path.join(__dirname, 'data');
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
 for (const [rel, val] of Object.entries({
-  'data/settings.json': '{"botMode":"public","groups":{}}', 'data/warnings.json': '{}',
+  'data/settings.json': '{"botMode":"public","groups":{}}',
+  'data/warnings.json': '{}',
 })) { const p = path.join(__dirname, rel); if (!fs.existsSync(p)) fs.writeFileSync(p, val); }
 
 const runtimeRoutes = require('./routes/runtime');
@@ -33,36 +34,46 @@ app.use('/runtime', requireApiKey, runtimeRoutes);
 app.get('/healthz', (_, res) => res.json({ ok: true, ts: Date.now() }));
 
 const PORT   = Number(process.env.PORT || 3000);
-const server = app.listen(PORT, '0.0.0.0', () => console.log('[BOTIFY X Core] Running on port ' + PORT));
+const server = app.listen(PORT, '0.0.0.0', () =>
+  console.log('[BOTIFY X Core] Running on port ' + PORT),
+);
 
+// ── Session restore with Postgres hydration ────────────────────────────────────
 const sessionManager = require('./utils/sessionManager');
 const registry       = require('./utils/sessionRegistry');
 const { hydrateFromPg } = require('./utils/dataManager');
 
-// ── Startup: hydrate settings from Postgres BEFORE restoring sessions ──────────
-// This ensures antilink/antigroupmention/antidelete flags survive Railway restarts
-// even without a mounted volume. Falls back silently if no DATABASE_URL.
-registry.init()
-  .then(() => hydrateFromPg())
-  .then(async () => {
-    const validSessions = await registry.getAllValid();
-    if (validSessions.length) {
-      console.log('[BOTIFY X] Auto-restoring ' + validSessions.length + ' valid session(s)...');
-      for (const id of validSessions) {
-        const wasActive = await registry.isActive(id).catch(() => false);
-        sessionManager.startSession({ id, isOwner: false, active: wasActive })
-          .catch(err => console.error('[BOTIFY X] Restore failed for ' + id + ':', err.message));
-      }
-    } else {
-      console.log('[BOTIFY X] No sessions to restore.');
+registry.init().then(async () => {
+  // ① Restore settings/state from Postgres to local JSON BEFORE starting sessions.
+  //    Without this step, Railway's ephemeral filesystem loses all anti-feature
+  //    settings on every restart and sessions come up with everything disabled.
+  if (process.env.DATABASE_URL) {
+    try {
+      await hydrateFromPg();
+    } catch (e) {
+      console.error('[BOTIFY X] Hydration from Postgres failed (non-fatal):', e.message);
     }
-  })
-  .catch(err => console.error('[BOTIFY X] Startup error:', err.message));
+  }
+
+  // ② Restore WhatsApp sessions from the registry.
+  const validSessions = await registry.getAllValid();
+  if (validSessions.length) {
+    console.log('[BOTIFY X] Auto-restoring ' + validSessions.length + ' valid session(s)...');
+    for (const id of validSessions) {
+      const wasActive = await registry.isActive(id).catch(() => false);
+      sessionManager
+        .startSession({ id, isOwner: false, active: wasActive })
+        .catch(err => console.error('[BOTIFY X] Restore failed for ' + id + ':', err.message));
+    }
+  } else {
+    console.log('[BOTIFY X] No sessions to restore.');
+  }
+}).catch(err => console.error('[BOTIFY X] Registry init failed:', err.message));
 
 function shutdown(sig) {
   console.log('[BOTIFY X] ' + sig + ' — shutting down gracefully...');
   server.close(() => { console.log('[BOTIFY X] HTTP server closed.'); process.exit(0); });
-  setTimeout(() => process.exit(1), 15000);
+  setTimeout(() => process.exit(1), 15_000);
 }
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT',  () => shutdown('SIGINT'));
