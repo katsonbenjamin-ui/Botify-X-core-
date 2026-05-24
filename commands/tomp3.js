@@ -1,10 +1,11 @@
 'use strict';
 
 /**
- * *tomp3 — extract audio from a video or convert voice/audio → MP3.
+ * *tomp3 — extract audio from a video, or convert voice/audio → MP3.
  * Reply to a video, audio, or voice message with *tomp3.
  *
- * ffmpeg-based. Oracle ARM compatible. Max 50 MB input protection.
+ * Fire-and-forget: handle() returns immediately; conversion runs in background.
+ * Max 50 MB input. Requires: ffmpeg (nixpacks.toml: nixPkgs = ["ffmpeg"])
  */
 
 const { downloadMediaMessage } = require('@whiskeysockets/baileys');
@@ -30,11 +31,11 @@ function tmpPath(ext) {
 }
 
 async function handle({ sock, from, msg }) {
-  const ctx = msg.message?.extendedTextMessage?.contextInfo;
-  const m   = msg.message || {};
+  const m   = msg.message;
+  const ctx = m?.extendedTextMessage?.contextInfo;
 
-  const directVid = m.videoMessage;
-  const directAud = m.audioMessage;
+  const directVid = m?.videoMessage;
+  const directAud = m?.audioMessage;
   const quotedVid = ctx?.quotedMessage?.videoMessage;
   const quotedAud = ctx?.quotedMessage?.audioMessage;
 
@@ -47,74 +48,80 @@ async function handle({ sock, from, msg }) {
     });
   }
 
-  try {
-    let target;
-    if (directVid || directAud) {
-      target = msg;
-    } else {
-      target = {
-        key: {
-          remoteJid:   from,
-          id:          ctx.stanzaId || msg.key.id,
-          participant: ctx.participant || null,
-          fromMe:      false,
-        },
-        message: ctx.quotedMessage,
-      };
-    }
+  await sock.sendMessage(from, { text: '🎵 _Converting to MP3..._' });
 
-    await sock.sendMessage(from, { text: '🎵 _Converting to MP3..._' });
-
-    let buf;
+  // Fire-and-forget: heavy work runs in background
+  setImmediate(async () => {
     try {
-      buf = await downloadMediaMessage(
-        target, 'buffer', {},
-        { logger: SLOG, reuploadRequest: sock.updateMediaMessage },
-      );
-    } catch (_) {
-      buf = await downloadMediaMessage(target, 'buffer', {}, { logger: SLOG });
+      let target;
+      if (directVid || directAud) {
+        target = msg;
+      } else {
+        target = {
+          key: {
+            remoteJid:   from,
+            id:          ctx.stanzaId || msg.key.id,
+            participant: ctx.participant || null,
+            fromMe:      false,
+          },
+          message: ctx.quotedMessage,
+        };
+      }
+
+      let buf;
+      try {
+        buf = await downloadMediaMessage(
+          target, 'buffer', {},
+          { logger: SLOG, reuploadRequest: sock.updateMediaMessage },
+        );
+      } catch (_) {
+        buf = await downloadMediaMessage(target, 'buffer', {}, { logger: SLOG });
+      }
+
+      if (!buf || buf.length === 0) {
+        return sock.sendMessage(from, {
+          text: '❌ Could not download media. It may have expired.',
+        });
+      }
+
+      if (buf.length > MAX_SIZE_MB * 1024 * 1024) {
+        return sock.sendMessage(from, {
+          text: `❌ File too large (max ${MAX_SIZE_MB} MB).`,
+        });
+      }
+
+      const inExt  = isVideo ? '.mp4' : '.ogg';
+      const inFile  = tmpPath(inExt);
+      const outFile = tmpPath('.mp3');
+
+      try {
+        fs.writeFileSync(inFile, buf);
+        await execFileAsync('ffmpeg', [
+          '-y', '-i', inFile,
+          '-vn',
+          '-acodec', 'libmp3lame',
+          '-q:a', '4',
+          '-ar', '44100',
+          outFile,
+        ], { timeout: 60_000 });
+
+        const mp3 = fs.readFileSync(outFile);
+        await sock.sendMessage(from, {
+          audio:    mp3,
+          mimetype: 'audio/mpeg',
+          ptt:      false,
+        });
+      } finally {
+        try { fs.unlinkSync(inFile);  } catch {}
+        try { fs.unlinkSync(outFile); } catch {}
+      }
+    } catch (e) {
+      console.error('[ToMp3]', e.message);
+      const hint = e.message.includes('ENOENT')
+        ? '\n⚠️ _ffmpeg not found — check nixpacks.toml_' : '';
+      try { await sock.sendMessage(from, { text: `❌ Conversion failed: ${e.message}${hint}` }); } catch {}
     }
-
-    if (!buf || buf.length === 0) {
-      return sock.sendMessage(from, { text: '❌ Could not download media. It may have expired.' });
-    }
-
-    // File size guard
-    if (buf.length > MAX_SIZE_MB * 1024 * 1024) {
-      return sock.sendMessage(from, {
-        text: `❌ File too large (max ${MAX_SIZE_MB} MB).`,
-      });
-    }
-
-    const inExt  = isVideo ? '.mp4' : '.ogg';
-    const inFile  = tmpPath(inExt);
-    const outFile = tmpPath('.mp3');
-
-    try {
-      fs.writeFileSync(inFile, buf);
-      await execFileAsync('ffmpeg', [
-        '-y', '-i', inFile,
-        '-vn',                     // no video
-        '-acodec', 'libmp3lame',
-        '-q:a', '4',               // ~130 kbps VBR
-        '-ar', '44100',
-        outFile,
-      ], { timeout: 60_000 });
-
-      const mp3 = fs.readFileSync(outFile);
-      await sock.sendMessage(from, {
-        audio:    mp3,
-        mimetype: 'audio/mpeg',
-        ptt:      false,
-      });
-    } finally {
-      try { fs.unlinkSync(inFile);  } catch {}
-      try { fs.unlinkSync(outFile); } catch {}
-    }
-  } catch (e) {
-    console.error('[ToMp3]', e.message);
-    await sock.sendMessage(from, { text: `❌ Conversion failed: ${e.message}` });
-  }
+  });
 }
 
 module.exports = { handle };

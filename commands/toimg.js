@@ -1,10 +1,11 @@
 'use strict';
 
 /**
- * *toimg — convert a sticker (WebP) to a regular image.
- * Reply to a sticker with *toimg to receive it as a viewable image.
+ * *toimg — convert a sticker (WebP) to a viewable image (PNG).
+ * Reply to a sticker with *toimg.
  *
- * ffmpeg-based, no sharp. Railway + Oracle ARM safe.
+ * Fire-and-forget: handle() returns immediately; conversion runs in background.
+ * Requires: ffmpeg (nixpacks.toml: nixPkgs = ["ffmpeg"])
  */
 
 const { downloadMediaMessage } = require('@whiskeysockets/baileys');
@@ -28,8 +29,10 @@ function tmpPath(ext) {
 }
 
 async function handle({ sock, from, msg }) {
-  const ctx = msg.message?.extendedTextMessage?.contextInfo;
-  const directSticker = msg.message?.stickerMessage;
+  const m   = msg.message;
+  const ctx = m?.extendedTextMessage?.contextInfo;
+
+  const directSticker = m?.stickerMessage;
   const quotedSticker = ctx?.quotedMessage?.stickerMessage;
 
   if (!directSticker && !quotedSticker) {
@@ -38,55 +41,61 @@ async function handle({ sock, from, msg }) {
     });
   }
 
-  try {
-    let target;
-    if (directSticker) {
-      target = msg;
-    } else {
-      target = {
-        key: {
-          remoteJid:   from,
-          id:          ctx.stanzaId || msg.key.id,
-          participant: ctx.participant || null,
-          fromMe:      false,
-        },
-        message: ctx.quotedMessage,
-      };
-    }
-
-    let buf;
+  // Fire-and-forget
+  setImmediate(async () => {
     try {
-      buf = await downloadMediaMessage(
-        target, 'buffer', {},
-        { logger: SLOG, reuploadRequest: sock.updateMediaMessage },
-      );
-    } catch (_) {
-      buf = await downloadMediaMessage(target, 'buffer', {}, { logger: SLOG });
-    }
+      let target;
+      if (directSticker) {
+        target = msg;
+      } else {
+        target = {
+          key: {
+            remoteJid:   from,
+            id:          ctx.stanzaId || msg.key.id,
+            participant: ctx.participant || null,
+            fromMe:      false,
+          },
+          message: ctx.quotedMessage,
+        };
+      }
 
-    if (!buf || buf.length === 0) {
-      return sock.sendMessage(from, { text: '❌ Could not download sticker. It may have expired.' });
-    }
+      let buf;
+      try {
+        buf = await downloadMediaMessage(
+          target, 'buffer', {},
+          { logger: SLOG, reuploadRequest: sock.updateMediaMessage },
+        );
+      } catch (_) {
+        buf = await downloadMediaMessage(target, 'buffer', {}, { logger: SLOG });
+      }
 
-    const inFile  = tmpPath('.webp');
-    const outFile = tmpPath('.png');
-    try {
-      fs.writeFileSync(inFile, buf);
-      // ffmpeg converts WebP → PNG cleanly on all platforms
-      await execFileAsync('ffmpeg', [
-        '-y', '-i', inFile, '-vframes', '1', outFile,
-      ], { timeout: 20_000 });
+      if (!buf || buf.length === 0) {
+        return sock.sendMessage(from, {
+          text: '❌ Could not download sticker. It may have expired.',
+        });
+      }
 
-      const imgBuf = fs.readFileSync(outFile);
-      await sock.sendMessage(from, { image: imgBuf });
-    } finally {
-      try { fs.unlinkSync(inFile);  } catch {}
-      try { fs.unlinkSync(outFile); } catch {}
+      const inFile  = tmpPath('.webp');
+      const outFile = tmpPath('.png');
+      try {
+        fs.writeFileSync(inFile, buf);
+        await execFileAsync('ffmpeg', [
+          '-y', '-i', inFile, '-vframes', '1', outFile,
+        ], { timeout: 20_000 });
+
+        const imgBuf = fs.readFileSync(outFile);
+        await sock.sendMessage(from, { image: imgBuf });
+      } finally {
+        try { fs.unlinkSync(inFile);  } catch {}
+        try { fs.unlinkSync(outFile); } catch {}
+      }
+    } catch (e) {
+      console.error('[ToImg]', e.message);
+      const hint = e.message.includes('ENOENT')
+        ? '\n⚠️ _ffmpeg not found — check nixpacks.toml_' : '';
+      try { await sock.sendMessage(from, { text: `❌ Conversion failed: ${e.message}${hint}` }); } catch {}
     }
-  } catch (e) {
-    console.error('[ToImg]', e.message);
-    await sock.sendMessage(from, { text: `❌ Conversion failed: ${e.message}` });
-  }
+  });
 }
 
 module.exports = { handle };
