@@ -1,14 +1,16 @@
 'use strict';
 
 /**
- * dataManager.js — persistent storage for settings, warnings, session state,
- * and message counts.
+ * dataManager.js — persistent storage for settings, warnings, session state.
  *
- * Primary storage : local JSON files (fast, synchronous).
- * Secondary storage: Postgres via pgStore (fire-and-forget write-through).
+ * ┌─────────────────────────────────────────────────────────────┐
+ * │  Primary : local JSON files (fast, sync, low overhead)      │
+ * │  Backup  : Postgres via pgStore (survives Railway restarts)  │
+ * └─────────────────────────────────────────────────────────────┘
  *
- * On startup call hydrateFromPg() ONCE before starting sessions so that
- * settings survive Railway / Oracle restarts even without a mounted volume.
+ * On startup, call hydrateFromPg() ONCE so that local JSON files are
+ * restored from Postgres before sessions are created.  After that,
+ * every write hits both the local file AND Postgres (async/best-effort).
  */
 
 const fs   = require('fs');
@@ -22,70 +24,105 @@ const CF = path.join(D, 'msgcounts.json');
 
 if (!fs.existsSync(D)) fs.mkdirSync(D, { recursive: true });
 
-// ── Low-level file helpers ─────────────────────────────────────────────────────
-function r(f, fb) { try { return JSON.parse(fs.readFileSync(f, 'utf8')); } catch { return fb; } }
-function w(f, d)  { fs.writeFileSync(f, JSON.stringify(d, null, 2)); }
+// ── Low-level helpers ──────────────────────────────────────────────────────────
+function r(f, fb) {
+  try { return JSON.parse(fs.readFileSync(f, 'utf8')); }
+  catch { return fb; }
+}
+function w(f, d) { fs.writeFileSync(f, JSON.stringify(d, null, 2)); }
 
-// ── Postgres write-through (best-effort, never blocks) ────────────────────────
-let pgStore = null;
+// ── Postgres write-through (lazy load — never crashes if pg unavailable) ───────
+let _pgStore = null;
 function pg() {
-  if (!pgStore && process.env.DATABASE_URL) {
-    try { pgStore = require('./pgStore'); } catch (_) {}
+  if (!_pgStore && process.env.DATABASE_URL) {
+    try { _pgStore = require('./pgStore'); } catch (_) {}
   }
-  return pgStore;
+  return _pgStore;
 }
 
+// Best-effort async write to Postgres. Never blocks; never throws to caller.
 function pgSave(key, value) {
   const store = pg();
   if (!store) return;
   store.set(key, value).catch(() => {});
 }
 
-// ── Hydrate local files from Postgres on startup ───────────────────────────────
+// ── ALL toggleable session-state keys ─────────────────────────────────────────
+// Adding a new flag here automatically:
+//   • includes it in loadSessionState defaults
+//   • saves it via saveSessionState
+//   • persists it to Postgres on every change
+const SESSION_STATE_KEYS = [
+  'anticall',
+  'antidelete',
+  'antiedit',
+  'alwaysonline',
+  'autoreact',
+  'autotyping',
+  'statusreply',
+];
+
+// ── Startup hydration from Postgres ───────────────────────────────────────────
+/**
+ * Call ONCE in index.js before restoring sessions.
+ * Reads settings, warnings, msgcounts, and all session states from Postgres
+ * and writes them to local JSON so loadSessionState() finds them.
+ */
 async function hydrateFromPg() {
   const store = pg();
   if (!store) return;
 
-  const keys = [
-    { pgKey: 'settings',  file: SF, fallback: { botMode: 'public', groups: {} } },
-    { pgKey: 'warnings',  file: WF, fallback: {} },
-    { pgKey: 'msgcounts', file: CF, fallback: {} },
-  ];
+  console.log('[dataManager] Hydrating from Postgres...');
 
-  for (const { pgKey, file } of keys) {
-    try {
-      const val = await store.get(pgKey);
-      if (val && typeof val === 'object') w(file, val);
-    } catch (_) {}
-  }
-
-  // Hydrate per-session state files
   try {
     await store.ready();
-    const { Pool } = require('pg');
-    const p = new Pool({
-      connectionString: process.env.DATABASE_URL,
-      ssl: { rejectUnauthorized: false },
-      max: 1,
-      idleTimeoutMillis: 5000,
-    });
-    const result = await p.query(
-      "SELECT key, value FROM botify_settings WHERE key LIKE 'state-%'"
-    );
-    await p.end();
-    for (const row of result.rows) {
-      const sf = _stateFile(row.key.replace(/^state-/, ''));
-      try { w(sf, row.value); } catch (_) {}
+
+    // Core data files
+    const hydrations = [
+      { key: 'settings',  file: SF, fallback: { botMode: 'public', groups: {} } },
+      { key: 'warnings',  file: WF, fallback: {} },
+      { key: 'msgcounts', file: CF, fallback: {} },
+    ];
+
+    for (const { key, file } of hydrations) {
+      try {
+        const val = await store.get(key);
+        if (val && typeof val === 'object') {
+          w(file, val);
+          console.log(`[dataManager] Restored ${key} from Postgres.`);
+        }
+      } catch (e) {
+        console.error(`[dataManager] Failed to restore ${key}:`, e.message);
+      }
     }
-  } catch (_) {}
+
+    // Session state files: any key matching state:*
+    const allKeys = await store.getAllKeys();
+    let stateCount = 0;
+    for (const key of allKeys) {
+      if (!key.startsWith('state:')) continue;
+      try {
+        const phoneOrId = key.slice(6);
+        const state = await store.get(key);
+        if (state && typeof state === 'object') {
+          w(_stateFile(phoneOrId), state);
+          stateCount++;
+        }
+      } catch (_) {}
+    }
+    if (stateCount) console.log(`[dataManager] Restored ${stateCount} session state(s) from Postgres.`);
+
+  } catch (e) {
+    console.error('[dataManager] Hydration failed (non-fatal):', e.message);
+  }
 }
 
-// ── Users ─────────────────────────────────────────────────────────────────────
-function getUsers() { return r(UF, []); }
+// ── Users ──────────────────────────────────────────────────────────────────────
+function getUsers()    { return r(UF, []); }
 
 function addUser(phone, days = 30) {
   const users  = getUsers();
-  const expiry = Date.now() + days * 86400000;
+  const expiry = Date.now() + days * 86_400_000;
   const i      = users.findIndex(u => u.phone === phone);
   if (i !== -1) {
     users[i].expiry = expiry;
@@ -122,18 +159,14 @@ function isUserAllowed(phone) {
 function getSessionOwnerMode(phone) {
   if (!phone) return getSettings().botMode || 'public';
   const user = getUsers().find(u => u.phone === phone);
-  if (user) return user.mode || 'public';
+  if (user)   return user.mode || 'public';
   return getSettings().botMode || 'public';
 }
 
 function setSessionOwnerMode(phone, mode) {
   if (mode !== 'public' && mode !== 'private') return;
   const updated = updateUser(phone, { mode });
-  if (!updated) {
-    const s = getSettings();
-    s.botMode = mode;
-    saveSettings(s);
-  }
+  if (!updated) { const s = getSettings(); s.botMode = mode; saveSettings(s); }
 }
 
 // ── Global settings ───────────────────────────────────────────────────────────
@@ -141,7 +174,7 @@ function getSettings()   { return r(SF, { botMode: 'public', groups: {} }); }
 
 function saveSettings(s) {
   w(SF, s);
-  pgSave('settings', s);
+  pgSave('settings', s);              // async write-through to Postgres
 }
 
 function getBotMode()     { return getSettings().botMode || 'public'; }
@@ -149,8 +182,8 @@ function setBotMode(mode) { const s = getSettings(); s.botMode = mode; saveSetti
 
 function getGroupSettings(gid) {
   const s = getSettings();
-  if (!s.groups)       s.groups = {};
-  if (!s.groups[gid])  s.groups[gid] = {
+  if (!s.groups)      s.groups = {};
+  if (!s.groups[gid]) s.groups[gid] = {
     antilink: false, welcome: false, goodbye: false, antigroupmention: false,
   };
   return s.groups[gid];
@@ -160,7 +193,7 @@ function updateGroupSettings(gid, patch) {
   const s = getSettings();
   if (!s.groups) s.groups = {};
   s.groups[gid] = { ...(s.groups[gid] || {}), ...patch };
-  saveSettings(s);
+  saveSettings(s);                    // persists group anti-features to Postgres
 }
 
 // ── Warnings ──────────────────────────────────────────────────────────────────
@@ -175,20 +208,16 @@ function addWarning(gid, phone) {
   const ww = getWarnings(); const k = `${gid}:${phone}`;
   ww[k] = (ww[k] || 0) + 1; _saveWarnings(ww); return ww[k];
 }
-function resetWarnings(gid, phone)  { const ww = getWarnings(); delete ww[`${gid}:${phone}`]; _saveWarnings(ww); }
-function getWarningCount(gid, phone){ return getWarnings()[`${gid}:${phone}`] || 0; }
+function resetWarnings(gid, phone) {
+  const ww = getWarnings(); delete ww[`${gid}:${phone}`]; _saveWarnings(ww);
+}
+function getWarningCount(gid, phone) { return getWarnings()[`${gid}:${phone}`] || 0; }
 
-// ── Per-session state persistence ──────────────────────────────────────────────
+// ── Per-session state ─────────────────────────────────────────────────────────
 function _stateFile(phoneOrId) {
   const key = String(phoneOrId || 'unknown').replace(/[^a-zA-Z0-9_-]/g, '_');
   return path.join(D, `state-${key}.json`);
 }
-
-// ⚠️ Add all toggleable session flags here so they persist across restarts.
-const SESSION_STATE_KEYS = [
-  'anticall', 'antidelete', 'antiedit', 'alwaysonline',
-  'autoreact', 'autotyping', 'statusreply',
-];
 
 function loadSessionState(phoneOrId) {
   const defaults = Object.fromEntries(SESSION_STATE_KEYS.map(k => [k, false]));
@@ -198,15 +227,17 @@ function loadSessionState(phoneOrId) {
 function saveSessionState(phoneOrId, state) {
   try {
     if (!fs.existsSync(D)) fs.mkdirSync(D, { recursive: true });
+    // Save all SESSION_STATE_KEYS (not a hardcoded subset)
     const slim = Object.fromEntries(SESSION_STATE_KEYS.map(k => [k, !!state[k]]));
     w(_stateFile(phoneOrId), slim);
-    pgSave(`state-${String(phoneOrId).replace(/[^a-zA-Z0-9_-]/g, '_')}`, slim);
+    // Async write-through to Postgres so state survives restarts
+    pgSave(`state:${String(phoneOrId).replace(/[^a-zA-Z0-9_-]/g, '_')}`, slim);
   } catch (e) {
-    console.error('[SaveSessionState]', phoneOrId, e.message);
+    console.error('[saveSessionState] Failed for', phoneOrId, '—', e.message);
   }
 }
 
-// ── Message count tracking (for *listactive / *topchat) ───────────────────────
+// ── Message count tracking ────────────────────────────────────────────────────
 function getMsgCounts() { return r(CF, {}); }
 
 function addMsgCount(groupJid, phone) {
@@ -215,7 +246,8 @@ function addMsgCount(groupJid, phone) {
     const k = `${groupJid}|||${phone}`;
     c[k] = (c[k] || 0) + 1;
     w(CF, c);
-    if (c[k] % 50 === 0) pgSave('msgcounts', c); // throttled Postgres sync
+    // Throttle Postgres sync to every 50 messages per member to reduce I/O
+    if (c[k] % 50 === 0) pgSave('msgcounts', c);
   } catch (_) {}
 }
 
@@ -244,6 +276,7 @@ function resetGroupMsgCounts(groupJid) {
 
 module.exports = {
   hydrateFromPg,
+  SESSION_STATE_KEYS,
   getUsers, addUser, removeUser, updateUser, isUserAllowed,
   getSessionOwnerMode, setSessionOwnerMode,
   getSettings, saveSettings, getBotMode, setBotMode,
