@@ -198,8 +198,26 @@ async function startSession({ id, phoneNumber = null, isOwner = false, active = 
     // Inactive: bot is connected but ignores all messages/commands silently
     if (!session.active) return;
     if (payload.type !== 'notify') return;
-    try { await handleMessages({ sock, session, payload }); }
-    catch (err) { logger.error({ err }, 'msg handler error'); }
+
+    // BUG FIX (#16): Prioritize fromMe (bot owner's phone) messages so linked
+    // user commands are never delayed behind a queue of public user messages.
+    // Split the batch: process owner messages first in their own micro-task,
+    // then handle the rest. Both batches run in the same event loop tick order
+    // but owner commands are guaranteed to be at the front of their batch.
+    const allMsgs   = payload.messages || [];
+    const ownerMsgs = allMsgs.filter(m => m.key?.fromMe);
+    const otherMsgs = allMsgs.filter(m => !m.key?.fromMe);
+
+    if (ownerMsgs.length > 0) {
+      try {
+        await handleMessages({ session, payload: { ...payload, messages: ownerMsgs } });
+      } catch (err) { logger.error({ err }, 'owner msg handler error'); }
+    }
+    if (otherMsgs.length > 0) {
+      try {
+        await handleMessages({ session, payload: { ...payload, messages: otherMsgs } });
+      } catch (err) { logger.error({ err }, 'msg handler error'); }
+    }
   });
 
   sock.ev.on('messages.delete', (item) => {
