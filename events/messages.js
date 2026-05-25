@@ -451,8 +451,17 @@ async function handleMessages({ session, payload }) {
         if (!isCmd) continue;
       }
 
-      // ── status@broadcast — auto-reply feature ──────────────────────────────
+      // ── status@broadcast — cache FIRST, then handle auto-reply ───────────────
+      // BUG FIX (#5, #4): Status messages were NOT cached before `continue`, so
+      // when the owner later reacted to a status, _handleReaction() called
+      // msgCache.get(reactedToId) and always got undefined — silently breaking
+      // both the reaction-based status save AND view-once reveal for statuses.
+      // Cache the full message NOW so reactions can retrieve it later.
       if (from === 'status@broadcast') {
+        const statusLabel = messageLabel(msg);
+        if (statusLabel && msg.key.id) {
+          msgCache.set(msg.key.id, { from, body: statusLabel, fullMsg: msg });
+        }
         if (typeof statusreplyCmd?.handleAutoReply === 'function') {
           await statusreplyCmd.handleAutoReply(sock, msg, state);
         }
@@ -693,7 +702,9 @@ async function handleMessageDelete(sock, update, state, session) {
   try {
     const sessionOwnerPhone = session?.phoneNumber || getAdminNumber();
     const dest              = selfJid(sessionOwnerPhone);
-    const keys              = update?.keys || (Array.isArray(update) ? update : []);
+    // BUG FIX: Array.prototype.keys is a method so update?.keys is truthy when
+    // update is an array — Array.isArray must be checked FIRST.
+    const keys = Array.isArray(update) ? update : (update?.keys ?? []);
     for (const key of keys) {
       if (key?.id) await _restoreDeletedMessage(sock, key.id, dest);
     }
