@@ -12,9 +12,14 @@ const cors    = require('cors');
 const DATA_DIR = path.join(__dirname, 'data');
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
+// BUG FIX (#13): msgcounts.json was never initialized — addMsgCount() writes to
+// it fine, but on a fresh Railway deployment the file didn't exist and topchat
+// would return empty until at least one message was processed and the file was
+// written for the first time. Initializing here ensures the file always exists.
 for (const [rel, val] of Object.entries({
-  'data/settings.json': '{"botMode":"public","groups":{}}',
-  'data/warnings.json': '{}',
+  'data/settings.json':  '{"botMode":"public","groups":{}}',
+  'data/warnings.json':  '{}',
+  'data/msgcounts.json': '{}',
 })) { const p = path.join(__dirname, rel); if (!fs.existsSync(p)) fs.writeFileSync(p, val); }
 
 const runtimeRoutes = require('./routes/runtime');
