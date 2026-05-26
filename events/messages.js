@@ -75,6 +75,7 @@ const commands = {
   welcome:          require('../commands/welcome'),
 };
 
+// msgCache kept here for vv/statusSaver reaction lookups (needs fullMsg)
 const msgCache = new NodeCache({ stdTTL: 1800, checkperiod: 120 });
 const cmdDedup = new NodeCache({ stdTTL: 15,   checkperiod: 5   });
 
@@ -123,12 +124,15 @@ async function handleMessages({ session, payload }) {
       const senderPhone = senderJid.split('@')[0].split(':')[0];
       const text = extractText(rawMsg) || '';
 
-      // Cache every message for antidelete / antiedit / vv secret
+      // Cache for vv/statusSaver reaction lookups (needs fullMsg)
       msgCache.set(msgId, {
         from, body: text, label: messageLabel(rawMsg),
         timestamp: rawMsg.messageTimestamp,
         fullMsg: JSON.parse(JSON.stringify(rawMsg)),
       });
+      // Feed antidelete + antiedit caches (each command owns its own cache)
+      commands.antidelete.cacheMessage?.(rawMsg);
+      commands.antiedit.cacheMessage?.(rawMsg);
 
       // ── Anti-group-mention ─────────────────────────────────────────
       if (isGroup && !isSelf && isGroupMentionMsg(rawMsg)) {
@@ -228,72 +232,56 @@ async function handleMessages({ session, payload }) {
 }
 
 // ── handleMessageDelete ───────────────────────────────────────────────────────
+// Fully delegated to commands/antidelete.js which owns the message cache
+// and the correct Baileys delete-event format handling.
 function handleMessageDelete(sock, item, sessionState, session) {
-  if (!sessionState?.antidelete) return;
-  const keys = item?.keys || (item?.key ? [item.key] : []);
-  for (const key of keys) {
-    if (key.fromMe) continue;
-    const c = msgCache.get(key.id);
-    if (!c) continue;
-    const from  = c.from || key.remoteJid;
-    const label = c.label || c.body || '[Media]';
-    const senderNum = (key.participant || from).split('@')[0].split(':')[0];
-    const op = session?.phoneNumber || '';
-    const dest = op ? op.replace(/\D/g, '') + '@s.whatsapp.net' : from;
-    sock.sendMessage(dest, {
-      text: `🗑️ *ANTIDELETE — Message Recovered*\n\n*From:* +${senderNum}\n*Chat:* ${from.endsWith('@g.us') ? 'Group' : 'Private'}\n\n*Content:* ${label}`,
-    }).catch(() => {});
-  }
+  commands.antidelete.onDelete?.(sock, item, sessionState, session);
 }
 
 // ── handleMessageEdit ─────────────────────────────────────────────────────────
 async function handleMessageEdit(sock, updates, sessionState, session) {
+  // Antiedit detection fully delegated to commands/antiedit.js.
+  // It uses the correct Baileys v6 path:
+  //   update.update.message.protocolMessage.type === 14  (MESSAGE_EDIT)
+  // The old path (update.update.editedMessage) never fires in Baileys v6.
+  if (sessionState?.antiedit) {
+    await commands.antiedit.onEdit?.(sock, updates, sessionState, session);
+  }
+
+  // Reaction handler (vv view-once reveal + status saver) — kept here because
+  // it needs fullMsg from the local msgCache (reactions are not edits).
   for (const update of updates) {
     try {
+      if (!update.update?.reactionMessage) continue;
+
+      const emoji = update.update.reactionMessage.text;
+      if (!emoji) continue;
+
       const msgId = update.key?.id;
       const tgt   = update.key?.remoteJid;
       const c     = msgId ? msgCache.get(msgId) : null;
+      if (!c) continue;
 
-      if (sessionState?.antiedit &&
-          (update.update?.editedMessage || update.update?.protocolMessage?.type === 14)) {
-        if (c) {
-          const op = session?.phoneNumber || '';
-          const dest = op ? op.replace(/\D/g, '') + '@s.whatsapp.net' : (c.from || tgt);
-          const editedText =
-            update.update?.editedMessage?.message?.extendedTextMessage?.text ||
-            update.update?.editedMessage?.message?.conversation || '[edited]';
-          await sock.sendMessage(dest, {
-            text: `✏️ *ANTIEDIT — Message Edited*\n\n*Original:* ${c.label || c.body || '[unknown]'}\n*Edited to:* ${editedText}`,
-          });
+      const op = session?.phoneNumber ||
+        sock?.user?.id?.split(':')[0]?.split('@')[0]?.replace(/\D/g, '') || '';
+
+      if (isViewOnce?.(c.fullMsg) && op) {
+        const inner = unwrapViewOnce?.(c.fullMsg.message);
+        if (inner) {
+          commands.vv?.handleSecret?.(sock, {
+            key: { remoteJid: c.from || tgt, id: msgId,
+              participant: update.key?.participant || null, fromMe: false },
+            message: inner,
+          }, selfJid?.(op)).catch(() => {});
         }
-        continue;
       }
 
-      if (update.update?.reactionMessage) {
-        const emoji = update.update.reactionMessage.text;
-        if (!emoji || !c) continue;
-
-        const op = session?.phoneNumber ||
-          sock?.user?.id?.split(':')[0]?.split('@')[0]?.replace(/\D/g, '') || '';
-
-        if (isViewOnce?.(c.fullMsg) && op) {
-          const inner = unwrapViewOnce?.(c.fullMsg.message);
-          if (inner) {
-            commands.vv?.handleSecret?.(sock, {
-              key: { remoteJid: c.from || tgt, id: msgId,
-                participant: update.key?.participant || null, fromMe: false },
-              message: inner,
-            }, selfJid?.(op)).catch(() => {});
-          }
-        }
-
-        if (tgt === 'status@broadcast' && op && c.fullMsg) {
-          commands.statusSaver?.handle?.(sock, c.fullMsg, op).catch(() => {});
-        }
+      if (tgt === 'status@broadcast' && op && c.fullMsg) {
+        commands.statusSaver?.handle?.(sock, c.fullMsg, op).catch(() => {});
       }
 
     } catch (e) {
-      console.error('[BOTIFY X] Pipeline error [update]:', e.message);
+      console.error('[BOTIFY X] Pipeline error [update/reaction]:', e.message);
     }
   }
 }
